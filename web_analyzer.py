@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -42,6 +43,7 @@ _fd_team_map_loaded = False
 # Rate limiter for football-data.org (10 req/min)
 _fd_last_call_time = 0.0
 _FD_MIN_INTERVAL = 4.0  # seconds between calls (safe for 10/min limit, was 6.5)
+_fd_rate_limit_lock = threading.Lock()
 
 
 # ── Cache helpers ────────────────────────────────────────────────────────────
@@ -73,11 +75,12 @@ def _cache_key(prefix: str, value: str) -> str:
 def _fd_rate_limit():
     """Enforce rate limiting for football-data.org."""
     global _fd_last_call_time
-    elapsed = time.time() - _fd_last_call_time
-    if elapsed < _FD_MIN_INTERVAL:
-        wait = _FD_MIN_INTERVAL - elapsed
-        time.sleep(wait)
-    _fd_last_call_time = time.time()
+    with _fd_rate_limit_lock:
+        elapsed = time.time() - _fd_last_call_time
+        if elapsed < _FD_MIN_INTERVAL:
+            wait = _FD_MIN_INTERVAL - elapsed
+            time.sleep(wait)
+        _fd_last_call_time = time.time()
 
 
 def _fd_get(endpoint: str, params: dict = None) -> dict:

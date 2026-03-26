@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
@@ -55,6 +56,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CONCURRENT_UPDATES = max(1, int(os.getenv("CONCURRENT_UPDATES", "8") or 8))
+REFRESH_CONCURRENCY = max(1, int(os.getenv("REFRESH_CONCURRENCY", "4") or 4))
+BOOKING_FETCH_CONCURRENCY = max(1, int(os.getenv("BOOKING_FETCH_CONCURRENCY", "4") or 4))
 
 # Conversation states for /check flow
 CHECK_CODES, CHECK_TARGET_ODDS, CHECK_EXCLUDE, CHECK_CONFIRM, CHECK_EXPAND, CHECK_REVIEW = range(6)
@@ -65,6 +69,125 @@ STRAT_CUSTOM_CONFIDENCE, STRAT_CUSTOM_MARKETS, STRAT_CUSTOM_OVER, STRAT_CUSTOM_M
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _runtime_mode_from_env() -> str:
+    """Resolve the configured runtime mode."""
+    runtime_mode = (os.getenv("BOT_MODE", "auto").strip().lower() or "auto")
+    if runtime_mode not in {"auto", "polling", "webhook"}:
+        runtime_mode = "auto"
+    if runtime_mode == "auto":
+        return "webhook" if os.getenv("WEBHOOK_URL", "").strip() else "polling"
+    return runtime_mode
+
+
+def _utc_now_iso() -> str:
+    """Return an ISO UTC timestamp without microseconds."""
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _format_duration(seconds: float) -> str:
+    """Format a small uptime/duration value for human display."""
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _health_state(application: Application) -> dict:
+    """Get or initialize in-memory runtime health state."""
+    state = application.bot_data.get("health")
+    if not isinstance(state, dict):
+        now = time.time()
+        state = {
+            "started_at": _utc_now_iso(),
+            "started_at_epoch": now,
+            "active_jobs": 0,
+            "last_job_name": None,
+            "last_job_started_at": None,
+            "last_job_finished_at": None,
+            "last_job_duration_ms": None,
+            "last_error": None,
+            "last_error_at": None,
+            "last_success_at": None,
+        }
+        application.bot_data["health"] = state
+    return state
+
+
+def _mark_job_start(context: ContextTypes.DEFAULT_TYPE, job_name: str) -> tuple[str, float]:
+    """Track the beginning of a long-running bot job."""
+    state = _health_state(context.application)
+    state["active_jobs"] = int(state.get("active_jobs", 0)) + 1
+    state["last_job_name"] = job_name
+    state["last_job_started_at"] = _utc_now_iso()
+    return job_name, time.monotonic()
+
+
+def _mark_job_finish(
+    context: ContextTypes.DEFAULT_TYPE,
+    token: tuple[str, float],
+    *,
+    success: bool = True,
+    error: Exception | None = None,
+) -> None:
+    """Track the end of a long-running bot job."""
+    state = _health_state(context.application)
+    state["active_jobs"] = max(0, int(state.get("active_jobs", 0)) - 1)
+    state["last_job_name"] = token[0]
+    state["last_job_finished_at"] = _utc_now_iso()
+    state["last_job_duration_ms"] = int((time.monotonic() - token[1]) * 1000)
+    if success:
+        state["last_success_at"] = state["last_job_finished_at"]
+    elif error is not None:
+        state["last_error_at"] = _utc_now_iso()
+        state["last_error"] = f"{type(error).__name__}: {error}"
+
+
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show runtime health for the currently running bot instance."""
+    state = _health_state(context.application)
+    budget = await asyncio.to_thread(get_api_budget)
+    uptime = _format_duration(time.time() - float(state.get("started_at_epoch", time.time())))
+    msg = (
+        "SportyBot Health\n\n"
+        f"Runtime Mode: {_runtime_mode_from_env()}\n"
+        f"Uptime: {uptime}\n"
+        f"Concurrent Updates: {CONCURRENT_UPDATES}\n"
+        f"Active Jobs: {state.get('active_jobs', 0)}\n"
+        f"Last Job: {state.get('last_job_name') or 'None'}\n"
+        f"Last Success: {state.get('last_success_at') or 'None'}\n"
+        f"Last Error: {state.get('last_error') or 'None'}\n"
+        f"Last Error At: {state.get('last_error_at') or 'None'}\n"
+        f"API Budget: {budget['remaining']}/{budget['limit']} remaining"
+    )
+    await update.message.reply_text(msg)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log unhandled exceptions and retain a lightweight health snapshot."""
+    err = context.error or RuntimeError("Unknown bot error")
+    state = _health_state(context.application)
+    state["last_error_at"] = _utc_now_iso()
+    state["last_error"] = f"{type(err).__name__}: {err}"
+    logger.exception("Unhandled exception while processing update", exc_info=err)
+
+    try:
+        if isinstance(update, Update):
+            if update.effective_message:
+                await update.effective_message.reply_text(
+                    "Something went wrong on my side. Please try that again in a moment."
+                )
+            elif update.effective_chat:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="Something went wrong on my side. Please try that again in a moment.",
+                )
+    except Exception:
+        logger.exception("Failed to send fallback error message")
 
 def format_pick(pick: dict, idx: int) -> str:
     """Format a single pick for Telegram display."""
@@ -1121,354 +1244,375 @@ async def _pick_analyze_from_message(message, context, target: float):
     import random, json, hashlib
     from pathlib import Path
 
-    chat_id = context.user_data.get("chat_id")
-    config = load_user_config(chat_id=chat_id)
-    leagues = config.get("leagues", [])
-    timeframe = config.get("timeframe", "7days")
-    today = datetime.now()
-    date_str = today.strftime("%Y-%m-%d")
-
-    # Check analysis cache first (valid for 3 hours)
-    cache_key_raw = f"pick_sportybet|{date_str}|{sorted(leagues)}|{timeframe}"
-    cache_key = hashlib.sha256(cache_key_raw.encode()).hexdigest()[:16]
-    cache_dir = Path(__file__).resolve().parent / ".cache" / "analysis"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"{cache_key}.json"
-
-    cached_scored = None
-    if cache_path.exists():
-        try:
-            import time as _time
-            cdata = json.loads(cache_path.read_text())
-            if _time.time() - cdata.get("_ts", 0) < 10800:  # 3 hour cache
-                cached_scored = cdata.get("picks", [])
-                logger.info(f"Using cached analysis: {len(cached_scored)} picks")
-        except Exception:
-            pass
-
-    if cached_scored:
-        await message.reply_text(
-            f"⚡ Using cached analysis ({len(cached_scored)} scored picks).\n"
-            f"Target: ~{target:.0f} odds",
-        )
-        context.user_data["pick_all_scored"] = cached_scored
-        context.user_data["pick_excluded"] = set()
-        return await _pick_build_combo(message, context)
-
-    # Resolve friendly names for display
-    from config import LEAGUE_NAMES, TIMEFRAME_PRESETS
-    league_display = ", ".join(LEAGUE_NAMES.get(lid, str(lid)) for lid in leagues) if leagues else "All leagues"
-    timeframe_display = TIMEFRAME_PRESETS.get(timeframe, {}).get("label", timeframe)
-
-    await message.reply_text(
-        f"🔍 Fetching upcoming matches from SportyBet...\n"
-        f"Leagues: {league_display}\n"
-        f"Window: {timeframe_display}\n"
-        f"Target: ~{target:.0f} odds\n"
-        f"First run — caching results for instant reshuffles.",
-    )
-
-    # Step 1: Get fixtures directly from SportyBet (has event IDs + real odds)
-    # Build tournament name filter from user's league config
-    from config import LEAGUE_SPORTYBET_NAMES
-    allowed_tournaments = None
-    if leagues:
-        allowed_tournaments = []
-        for lid in leagues:
-            allowed_tournaments.extend(LEAGUE_SPORTYBET_NAMES.get(lid, []))
+    job_token = _mark_job_start(context, "pick_analysis")
+    job_success = False
+    job_error = None
 
     try:
-        all_sporty_events = await asyncio.to_thread(fetch_all_events, max_pages=5, allowed_tournaments=allowed_tournaments or None)
-    except Exception as e:
-        logger.warning(f"SportyBet fetch failed: {e}")
-        all_sporty_events = []
+        chat_id = context.user_data.get("chat_id")
+        config = load_user_config(chat_id=chat_id)
+        leagues = config.get("leagues", [])
+        timeframe = config.get("timeframe", "7days")
+        today = datetime.now()
+        date_str = today.strftime("%Y-%m-%d")
 
-    if not all_sporty_events:
+        # Check analysis cache first (valid for 3 hours)
+        cache_key_raw = f"pick_sportybet|{date_str}|{sorted(leagues)}|{timeframe}"
+        cache_key = hashlib.sha256(cache_key_raw.encode()).hexdigest()[:16]
+        cache_dir = Path(__file__).resolve().parent / ".cache" / "analysis"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"{cache_key}.json"
+
+        cached_scored = None
+        if cache_path.exists():
+            try:
+                import time as _time
+                cdata = json.loads(cache_path.read_text())
+                if _time.time() - cdata.get("_ts", 0) < 10800:  # 3 hour cache
+                    cached_scored = cdata.get("picks", [])
+                    logger.info(f"Using cached analysis: {len(cached_scored)} picks")
+            except Exception:
+                pass
+
+        if cached_scored:
+            await message.reply_text(
+                f"⚡ Using cached analysis ({len(cached_scored)} scored picks).\n"
+                f"Target: ~{target:.0f} odds",
+            )
+            context.user_data["pick_all_scored"] = cached_scored
+            context.user_data["pick_excluded"] = set()
+            job_success = True
+            return await _pick_build_combo(message, context)
+
+        # Resolve friendly names for display
+        from config import LEAGUE_NAMES, TIMEFRAME_PRESETS
+        league_display = ", ".join(LEAGUE_NAMES.get(lid, str(lid)) for lid in leagues) if leagues else "All leagues"
+        timeframe_display = TIMEFRAME_PRESETS.get(timeframe, {}).get("label", timeframe)
+
         await message.reply_text(
-            "Could not fetch fixtures from SportyBet.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Retry", callback_data=f"pick_target_{target}")],
-            ]),
+            f"🔍 Fetching upcoming matches from SportyBet...\n"
+            f"Leagues: {league_display}\n"
+            f"Window: {timeframe_display}\n"
+            f"Target: ~{target:.0f} odds\n"
+            f"First run — caching results for instant reshuffles.",
         )
-        return PICK_ODDS
 
-    # Filter by league + timeframe
-    sporty_events = filter_events(all_sporty_events, league_ids=leagues, timeframe=timeframe)
-
-    if not sporty_events:
-        await message.reply_text(
-            f"No matches found for {league_display} in {timeframe_display}.\n"
-            f"Try /timeframe to change window or /leagues to add leagues."
-        )
-        return ConversationHandler.END
-
-    total_matches = len(sporty_events)
-    progress_msg = await message.reply_text(
-        f"Found {total_matches} matches ({len(all_sporty_events)} total on SportyBet).\n"
-        f"Analyzing form data... 0/{total_matches}"
-    )
-
-    # Step 2: Score every fixture using football-data.org form data
-    all_scored = []
-    analyzed_count = 0
-    _last_progress = 0
-
-    for ev in sporty_events:
-        home_name = ev["home"]
-        away_name = ev["away"]
-        event_id = ev["eventId"]
-        tournament = ev.get("tournament", "")
-        kick_off = ev.get("estimateStartTime", 0)
-        markets = ev.get("markets", {})
-
-        # Get real odds from SportyBet markets
-        # 1X2 is keyed as "1", GG/NG as "29"
-        # Over/Under uses compound keys: "18|total=0.5", "18|total=1.5", "18|total=2.5" etc.
-        real_1x2 = markets.get("1", {})
-        real_gg = markets.get("29", {})
+        # Step 1: Get fixtures directly from SportyBet (has event IDs + real odds)
+        # Build tournament name filter from user's league config
+        from config import LEAGUE_SPORTYBET_NAMES
+        allowed_tournaments = None
+        if leagues:
+            allowed_tournaments = []
+            for lid in leagues:
+                allowed_tournaments.extend(LEAGUE_SPORTYBET_NAMES.get(lid, []))
 
         try:
-            home_results = await asyncio.to_thread(get_team_results, home_name, count=10)
-            away_results = await asyncio.to_thread(get_team_results, away_name, count=10)
+            all_sporty_events = await asyncio.to_thread(fetch_all_events, max_pages=5, allowed_tournaments=allowed_tournaments or None)
+        except Exception as e:
+            logger.warning(f"SportyBet fetch failed: {e}")
+            all_sporty_events = []
 
-            if not home_results or not away_results:
-                # Still include with odds-only analysis if we have markets
-                if not real_1x2.get("outcomes"):
-                    continue
-                # Use odds-based estimation when no form data
-                home_form = None
-                away_form = None
-            else:
-                home_form = _summarize_form(home_results)
-                away_form = _summarize_form(away_results)
+        if not all_sporty_events:
+            await message.reply_text(
+                "Could not fetch fixtures from SportyBet.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Retry", callback_data=f"pick_target_{target}")],
+                ]),
+            )
+            job_success = True
+            return PICK_ODDS
 
-            analyzed_count += 1
+        # Filter by league + timeframe
+        sporty_events = filter_events(all_sporty_events, league_ids=leagues, timeframe=timeframe)
 
-            # Update progress every 5 matches
-            if analyzed_count - _last_progress >= 5:
-                _last_progress = analyzed_count
-                try:
-                    await progress_msg.edit_text(
-                        f"Found {total_matches} matches.\n"
-                        f"Analyzing form data... {analyzed_count}/{total_matches}"
-                    )
-                except Exception:
-                    pass  # Telegram rate limit, ignore
+        if not sporty_events:
+            await message.reply_text(
+                f"No matches found for {league_display} in {timeframe_display}.\n"
+                f"Try /timeframe to change window or /leagues to add leagues."
+            )
+            job_success = True
+            return ConversationHandler.END
 
-            # Convert kickoff timestamp to date string
-            match_date = ""
-            if kick_off:
-                try:
-                    match_date = datetime.fromtimestamp(kick_off / 1000).strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    match_date = ""
+        total_matches = len(sporty_events)
+        progress_msg = await message.reply_text(
+            f"Found {total_matches} matches ({len(all_sporty_events)} total on SportyBet).\n"
+            f"Analyzing form data... 0/{total_matches}"
+        )
 
-            base_pick = {
-                "home": home_name,
-                "away": away_name,
-                "league": tournament,
-                "date": match_date,
-                "match_status": "Upcoming",
-                "is_winning": None,
-                "score": "",
-                "event_id": event_id,
-                "selection": {},
-                "tournament": tournament,
-                "_source": "sportybet",
-                "_sporty_event": ev,  # Keep full event for booking
-            }
+        # Step 2: Score every fixture using football-data.org form data
+        all_scored = []
+        analyzed_count = 0
+        _last_progress = 0
 
-            if home_form and away_form:
-                # ── Multi-factor scoring via scorer.py ──
-                data_quality = "good"
-                scores = score_match(home_form, away_form, home_results, away_results)
+        for ev in sporty_events:
+            home_name = ev["home"]
+            away_name = ev["away"]
+            event_id = ev["eventId"]
+            tournament = ev.get("tournament", "")
+            kick_off = ev.get("estimateStartTime", 0)
+            markets = ev.get("markets", {})
 
-                # Helper to get real odds from SportyBet
-                def _get_odds_1x2(outcome_id: str) -> float:
-                    o = real_1x2.get("outcomes", {}).get(outcome_id, {})
+            # Get real odds from SportyBet markets
+            # 1X2 is keyed as "1", GG/NG as "29"
+            # Over/Under uses compound keys: "18|total=0.5", "18|total=1.5", "18|total=2.5" etc.
+            real_1x2 = markets.get("1", {})
+            real_gg = markets.get("29", {})
+
+            try:
+                home_results, away_results = await asyncio.gather(
+                    asyncio.to_thread(get_team_results, home_name, count=10),
+                    asyncio.to_thread(get_team_results, away_name, count=10),
+                )
+
+                if not home_results or not away_results:
+                    # Still include with odds-only analysis if we have markets
+                    if not real_1x2.get("outcomes"):
+                        continue
+                    # Use odds-based estimation when no form data
+                    home_form = None
+                    away_form = None
+                else:
+                    home_form = _summarize_form(home_results)
+                    away_form = _summarize_form(away_results)
+
+                analyzed_count += 1
+
+                # Update progress every 5 matches
+                if analyzed_count - _last_progress >= 5:
+                    _last_progress = analyzed_count
                     try:
-                        return float(o.get("odds", "0"))
-                    except (ValueError, TypeError):
-                        return 0.0
+                        await progress_msg.edit_text(
+                            f"Found {total_matches} matches.\n"
+                            f"Analyzing form data... {analyzed_count}/{total_matches}"
+                        )
+                    except Exception:
+                        pass  # Telegram rate limit, ignore
 
-                def _get_over_odds(threshold: float) -> float:
-                    mkt = markets.get(f"18|total={threshold}", {})
-                    o12 = mkt.get("outcomes", {}).get("12", {})
+                # Convert kickoff timestamp to date string
+                match_date = ""
+                if kick_off:
                     try:
-                        return float(o12.get("odds", "0"))
-                    except (ValueError, TypeError):
-                        return 0.0
+                        match_date = datetime.fromtimestamp(kick_off / 1000).strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        match_date = ""
 
-                def _get_gg_odds() -> float:
-                    o = real_gg.get("outcomes", {}).get("74", {})
-                    try:
-                        return float(o.get("odds", "0"))
-                    except (ValueError, TypeError):
-                        return 0.0
+                base_pick = {
+                    "home": home_name,
+                    "away": away_name,
+                    "league": tournament,
+                    "date": match_date,
+                    "match_status": "Upcoming",
+                    "is_winning": None,
+                    "score": "",
+                    "event_id": event_id,
+                    "selection": {},
+                    "tournament": tournament,
+                    "_source": "sportybet",
+                    "_sporty_event": ev,  # Keep full event for booking
+                }
 
-                def _verdict(conf: int) -> str:
-                    if conf >= 75:
-                        return "strong"
-                    elif conf >= 60:
-                        return "moderate"
-                    return "weak"
+                if home_form and away_form:
+                    # ── Multi-factor scoring via scorer.py ──
+                    data_quality = "good"
+                    scores = score_match(home_form, away_form, home_results, away_results)
 
-                # ── Home Win ──
-                hw = scores["home_win"]
-                real_home_odds = _get_odds_1x2("1")
-                if real_home_odds > 1.0:
-                    checked = cross_check_with_odds(hw["confidence"], real_home_odds)
-                    conf = checked["confidence"]
-                    reasons = hw["reasons"][:]
-                    if checked["warning"]:
-                        reasons.append(checked["warning"])
-                    if conf >= 45:
-                        all_scored.append({
-                            **base_pick,
-                            "market": "1X2", "pick": "Home",
-                            "odds": real_home_odds,
-                            "confidence": conf, "data_confidence": conf,
-                            "verdict": _verdict(conf),
-                            "analysis_reasons": reasons,
-                            "suggestion": None, "data_quality": data_quality,
-                            "rating": "safe" if conf >= 70 else "moderate",
-                        })
+                    # Helper to get real odds from SportyBet
+                    def _get_odds_1x2(outcome_id: str) -> float:
+                        o = real_1x2.get("outcomes", {}).get(outcome_id, {})
+                        try:
+                            return float(o.get("odds", "0"))
+                        except (ValueError, TypeError):
+                            return 0.0
 
-                # ── Away Win ──
-                aw = scores["away_win"]
-                real_away_odds = _get_odds_1x2("3")
-                if real_away_odds > 1.0:
-                    checked = cross_check_with_odds(aw["confidence"], real_away_odds)
-                    conf = checked["confidence"]
-                    reasons = aw["reasons"][:]
-                    if checked["warning"]:
-                        reasons.append(checked["warning"])
-                    if conf >= 45:
-                        all_scored.append({
-                            **base_pick,
-                            "market": "1X2", "pick": "Away",
-                            "odds": real_away_odds,
-                            "confidence": conf, "data_confidence": conf,
-                            "verdict": _verdict(conf),
-                            "analysis_reasons": reasons,
-                            "suggestion": None, "data_quality": data_quality,
-                            "rating": "safe" if conf >= 70 else "moderate",
-                        })
+                    def _get_over_odds(threshold: float) -> float:
+                        mkt = markets.get(f"18|total={threshold}", {})
+                        o12 = mkt.get("outcomes", {}).get("12", {})
+                        try:
+                            return float(o12.get("odds", "0"))
+                        except (ValueError, TypeError):
+                            return 0.0
 
-                # ── Over 0.5 / 1.5 / 2.5 ──
-                for threshold, key in [(0.5, "over_0.5"), (1.5, "over_1.5"), (2.5, "over_2.5")]:
-                    ov = scores[key]
-                    real_odds = _get_over_odds(threshold)
-                    if real_odds > 1.0:
-                        checked = cross_check_with_odds(ov["confidence"], real_odds)
+                    def _get_gg_odds() -> float:
+                        o = real_gg.get("outcomes", {}).get("74", {})
+                        try:
+                            return float(o.get("odds", "0"))
+                        except (ValueError, TypeError):
+                            return 0.0
+
+                    def _verdict(conf: int) -> str:
+                        if conf >= 75:
+                            return "strong"
+                        elif conf >= 60:
+                            return "moderate"
+                        return "weak"
+
+                    # ── Home Win ──
+                    hw = scores["home_win"]
+                    real_home_odds = _get_odds_1x2("1")
+                    if real_home_odds > 1.0:
+                        checked = cross_check_with_odds(hw["confidence"], real_home_odds)
                         conf = checked["confidence"]
-                        reasons = ov["reasons"][:]
+                        reasons = hw["reasons"][:]
                         if checked["warning"]:
                             reasons.append(checked["warning"])
                         if conf >= 45:
                             all_scored.append({
                                 **base_pick,
-                                "market": "Over/Under",
-                                "pick": f"Over (total={threshold})",
-                                "odds": real_odds,
+                                "market": "1X2", "pick": "Home",
+                                "odds": real_home_odds,
                                 "confidence": conf, "data_confidence": conf,
                                 "verdict": _verdict(conf),
                                 "analysis_reasons": reasons,
                                 "suggestion": None, "data_quality": data_quality,
-                                "rating": "safe" if threshold <= 1.5 else "moderate",
+                                "rating": "safe" if conf >= 70 else "moderate",
                             })
 
-                # ── BTTS ──
-                bt = scores["btts"]
-                gg_odds = _get_gg_odds()
-                if gg_odds > 1.0:
-                    checked = cross_check_with_odds(bt["confidence"], gg_odds)
-                    conf = checked["confidence"]
-                    reasons = bt["reasons"][:]
-                    if checked["warning"]:
-                        reasons.append(checked["warning"])
-                    if conf >= 45:
+                    # ── Away Win ──
+                    aw = scores["away_win"]
+                    real_away_odds = _get_odds_1x2("3")
+                    if real_away_odds > 1.0:
+                        checked = cross_check_with_odds(aw["confidence"], real_away_odds)
+                        conf = checked["confidence"]
+                        reasons = aw["reasons"][:]
+                        if checked["warning"]:
+                            reasons.append(checked["warning"])
+                        if conf >= 45:
+                            all_scored.append({
+                                **base_pick,
+                                "market": "1X2", "pick": "Away",
+                                "odds": real_away_odds,
+                                "confidence": conf, "data_confidence": conf,
+                                "verdict": _verdict(conf),
+                                "analysis_reasons": reasons,
+                                "suggestion": None, "data_quality": data_quality,
+                                "rating": "safe" if conf >= 70 else "moderate",
+                            })
+
+                    # ── Over 0.5 / 1.5 / 2.5 ──
+                    for threshold, key in [(0.5, "over_0.5"), (1.5, "over_1.5"), (2.5, "over_2.5")]:
+                        ov = scores[key]
+                        real_odds = _get_over_odds(threshold)
+                        if real_odds > 1.0:
+                            checked = cross_check_with_odds(ov["confidence"], real_odds)
+                            conf = checked["confidence"]
+                            reasons = ov["reasons"][:]
+                            if checked["warning"]:
+                                reasons.append(checked["warning"])
+                            if conf >= 45:
+                                all_scored.append({
+                                    **base_pick,
+                                    "market": "Over/Under",
+                                    "pick": f"Over (total={threshold})",
+                                    "odds": real_odds,
+                                    "confidence": conf, "data_confidence": conf,
+                                    "verdict": _verdict(conf),
+                                    "analysis_reasons": reasons,
+                                    "suggestion": None, "data_quality": data_quality,
+                                    "rating": "safe" if threshold <= 1.5 else "moderate",
+                                })
+
+                    # ── BTTS ──
+                    bt = scores["btts"]
+                    gg_odds = _get_gg_odds()
+                    if gg_odds > 1.0:
+                        checked = cross_check_with_odds(bt["confidence"], gg_odds)
+                        conf = checked["confidence"]
+                        reasons = bt["reasons"][:]
+                        if checked["warning"]:
+                            reasons.append(checked["warning"])
+                        if conf >= 45:
+                            all_scored.append({
+                                **base_pick,
+                                "market": "GG/NG", "pick": "GG",
+                                "odds": gg_odds,
+                                "confidence": conf, "data_confidence": conf,
+                                "verdict": _verdict(conf),
+                                "analysis_reasons": reasons,
+                                "suggestion": None, "data_quality": data_quality,
+                                "rating": "moderate",
+                            })
+
+                    # ── Extended markets ──
+                    _add_extended_picks(
+                        all_scored, scores, markets, base_pick,
+                        data_quality, _verdict,
+                    )
+
+                else:
+                    # ── Odds-only analysis (no form data available) ──
+                    # Cap confidence low — odds are market prices, not analysis
+                    home_outcome = real_1x2.get("outcomes", {}).get("1", {})
+                    try:
+                        real_home_odds = float(home_outcome.get("odds", "0"))
+                    except (ValueError, TypeError):
+                        real_home_odds = 0
+
+                    if 1.01 < real_home_odds < 1.50:
+                        # Cap at 40% — no form data means low confidence regardless of odds
+                        implied_conf = int(min(40, (1 / real_home_odds) * 50))
                         all_scored.append({
                             **base_pick,
-                            "market": "GG/NG", "pick": "GG",
-                            "odds": gg_odds,
-                            "confidence": conf, "data_confidence": conf,
-                            "verdict": _verdict(conf),
-                            "analysis_reasons": reasons,
-                            "suggestion": None, "data_quality": data_quality,
-                            "rating": "moderate",
+                            "market": "1X2", "pick": "Home",
+                            "odds": real_home_odds,
+                            "confidence": implied_conf,
+                            "data_confidence": implied_conf,
+                            "verdict": "weak",
+                            "analysis_reasons": [f"⚠ No form data — odds-only estimate: {real_home_odds:.2f}"],
+                            "suggestion": None, "data_quality": "limited",
+                            "rating": "weak",
                         })
 
-                # ── Extended markets ──
-                _add_extended_picks(
-                    all_scored, scores, markets, base_pick,
-                    data_quality, _verdict,
-                )
+            except Exception as e:
+                logger.warning(f"Error analyzing {home_name} vs {away_name}: {e}")
 
-            else:
-                # ── Odds-only analysis (no form data available) ──
-                # Cap confidence low — odds are market prices, not analysis
-                home_outcome = real_1x2.get("outcomes", {}).get("1", {})
-                try:
-                    real_home_odds = float(home_outcome.get("odds", "0"))
-                except (ValueError, TypeError):
-                    real_home_odds = 0
+        if not all_scored:
+            await message.reply_text(
+                "Could not analyze any fixtures.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Retry", callback_data=f"pick_target_{target}")],
+                ]),
+            )
+            job_success = True
+            return PICK_ODDS
 
-                if 1.01 < real_home_odds < 1.50:
-                    # Cap at 40% — no form data means low confidence regardless of odds
-                    implied_conf = int(min(40, (1 / real_home_odds) * 50))
-                    all_scored.append({
-                        **base_pick,
-                        "market": "1X2", "pick": "Home",
-                        "odds": real_home_odds,
-                        "confidence": implied_conf,
-                        "data_confidence": implied_conf,
-                        "verdict": "weak",
-                        "analysis_reasons": [f"⚠ No form data — odds-only estimate: {real_home_odds:.2f}"],
-                        "suggestion": None, "data_quality": "limited",
-                        "rating": "weak",
-                    })
+        try:
+            await progress_msg.edit_text(
+                f"✅ Analyzed {analyzed_count} matches — {len(all_scored)} picks scored.\n"
+                f"Building best combo for ~{target:.0f} odds..."
+            )
+        except Exception:
+            await message.reply_text(
+                f"✅ Analyzed {analyzed_count} matches — {len(all_scored)} picks scored.\n"
+                f"Building best combo for ~{target:.0f} odds..."
+            )
 
+        # Cache the analysis for 3 hours (strip _sporty_event for JSON serialization)
+        try:
+            import time as _time
+            cache_picks = []
+            for p in all_scored:
+                cp = {k: v for k, v in p.items() if k != "_sporty_event"}
+                cache_picks.append(cp)
+            cache_path.write_text(json.dumps({"_ts": _time.time(), "picks": cache_picks}))
+            logger.info(f"Cached {len(cache_picks)} scored picks to {cache_path.name}")
         except Exception as e:
-            logger.warning(f"Error analyzing {home_name} vs {away_name}: {e}")
+            logger.warning(f"Failed to cache analysis: {e}")
 
-    if not all_scored:
-        await message.reply_text(
-            "Could not analyze any fixtures.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Retry", callback_data=f"pick_target_{target}")],
-            ]),
-        )
-        return PICK_ODDS
+        # Store full pool and build first combo
+        context.user_data["pick_all_scored"] = all_scored
+        context.user_data["pick_excluded"] = set()
 
-    try:
-        await progress_msg.edit_text(
-            f"✅ Analyzed {analyzed_count} matches — {len(all_scored)} picks scored.\n"
-            f"Building best combo for ~{target:.0f} odds..."
-        )
-    except Exception:
-        await message.reply_text(
-            f"✅ Analyzed {analyzed_count} matches — {len(all_scored)} picks scored.\n"
-            f"Building best combo for ~{target:.0f} odds..."
-        )
-
-    # Cache the analysis for 3 hours (strip _sporty_event for JSON serialization)
-    try:
-        import time as _time
-        cache_picks = []
-        for p in all_scored:
-            cp = {k: v for k, v in p.items() if k != "_sporty_event"}
-            cache_picks.append(cp)
-        cache_path.write_text(json.dumps({"_ts": _time.time(), "picks": cache_picks}))
-        logger.info(f"Cached {len(cache_picks)} scored picks to {cache_path.name}")
+        job_success = True
+        return await _pick_build_combo(message, context)
     except Exception as e:
-        logger.warning(f"Failed to cache analysis: {e}")
-
-    # Store full pool and build first combo
-    context.user_data["pick_all_scored"] = all_scored
-    context.user_data["pick_excluded"] = set()
-
-    return await _pick_build_combo(message, context)
+        job_error = e
+        logger.exception("Pick analysis failed")
+        await message.reply_text(
+            "I hit an unexpected error while building those picks. Please try again in a moment."
+        )
+        return ConversationHandler.END
+    finally:
+        _mark_job_finish(context, job_token, success=job_success, error=job_error)
 
 
 def _confidence_verdict(conf: int) -> str:
@@ -2935,10 +3079,12 @@ async def pick_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Refresh cached data — fetches fixtures from football-data.org (2-week window)."""
+    job_token = _mark_job_start(context, "refresh")
     config = load_user_config(chat_id=update.effective_chat.id)
     leagues = config.get("leagues", [])
 
     if not leagues:
+        _mark_job_finish(context, job_token)
         await update.message.reply_text("No leagues configured. Run /leagues first.")
         return
 
@@ -2953,15 +3099,36 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total_fixtures = 0
     league_results = []
+    sem = asyncio.Semaphore(min(REFRESH_CONCURRENCY, max(len(leagues), 1)))
 
-    for lid in leagues:
+    async def _refresh_league(lid: int) -> tuple[int, str]:
         name = LEAGUE_NAMES.get(lid, str(lid))
-        try:
-            fixtures = await asyncio.to_thread(get_fixtures_lookahead, lid, date_from=date_from, date_to=date_to)
-            total_fixtures += len(fixtures)
-            league_results.append(f"  {name}: {len(fixtures)} matches")
-        except Exception as e:
-            league_results.append(f"  {name}: ERROR - {e}")
+        async with sem:
+            try:
+                fixtures = await asyncio.to_thread(
+                    get_fixtures_lookahead,
+                    lid,
+                    date_from=date_from,
+                    date_to=date_to,
+                )
+                return len(fixtures), f"  {name}: {len(fixtures)} matches"
+            except Exception as e:
+                logger.warning("Refresh failed for %s: %s", name, e)
+                return 0, f"  {name}: ERROR - {e}"
+
+    try:
+        results = await asyncio.gather(*[_refresh_league(lid) for lid in leagues])
+    except Exception as e:
+        _mark_job_finish(context, job_token, success=False, error=e)
+        logger.exception("Refresh command failed")
+        await update.message.reply_text(
+            "Refresh failed before I could finish. Please try again shortly."
+        )
+        return
+
+    for fixture_count, line in results:
+        total_fixtures += fixture_count
+        league_results.append(line)
 
     msg = (
         f"✅ Refresh complete\n\n"
@@ -2970,6 +3137,7 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Window: {date_from} to {date_to}\n\n"
         f"Run /pick to get selections."
     )
+    _mark_job_finish(context, job_token)
     await update.message.reply_text(msg)
 
 
@@ -3393,14 +3561,31 @@ async def check_receive_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, codes: list[str]):
     """Fetch booking codes, score them using scorer.py + real SportyBet odds, then ask to expand."""
+    job_token = _mark_job_start(context, "check_codes")
+    job_success = False
+    job_error = None
     await update.message.reply_text(f"🔍 Fetching {len(codes)} code(s): {', '.join(codes)}...")
 
     all_picks = []
     valid_codes = []
     failed_codes = []
 
-    for code in codes:
-        data = await asyncio.to_thread(fetch_booking_code, code)
+    sem = asyncio.Semaphore(min(BOOKING_FETCH_CONCURRENCY, max(len(codes), 1)))
+
+    async def _fetch_code(code: str) -> tuple[str, dict | None]:
+        async with sem:
+            return code, await asyncio.to_thread(fetch_booking_code, code)
+
+    try:
+        fetched_codes = await asyncio.gather(*[_fetch_code(code) for code in codes])
+    except Exception as e:
+        job_error = e
+        logger.exception("Booking code fetch failed")
+        _mark_job_finish(context, job_token, success=False, error=job_error)
+        await update.message.reply_text("I couldn't fetch those booking codes right now. Please try again shortly.")
+        return ConversationHandler.END
+
+    for code, data in fetched_codes:
         if data:
             picks = parse_outcomes(data)
             all_picks.extend(picks)
@@ -3412,6 +3597,8 @@ async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
         await update.message.reply_text(f"Could not fetch: {', '.join(failed_codes)}")
 
     if not all_picks:
+        job_success = True
+        _mark_job_finish(context, job_token, success=True)
         await update.message.reply_text("No valid picks found in any code.")
         return ConversationHandler.END
 
@@ -3444,8 +3631,10 @@ async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
             sporty_event = await asyncio.to_thread(find_event, home_name, away_name)
 
             # 2. Fetch form data for scoring
-            home_results = await asyncio.to_thread(get_team_results, home_name, count=10)
-            away_results = await asyncio.to_thread(get_team_results, away_name, count=10)
+            home_results, away_results = await asyncio.gather(
+                asyncio.to_thread(get_team_results, home_name, count=10),
+                asyncio.to_thread(get_team_results, away_name, count=10),
+            )
 
             home_form = _summarize_form(home_results) if home_results else None
             away_form = _summarize_form(away_results) if away_results else None
@@ -3618,7 +3807,7 @@ async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
                 analyzed_count += 1
 
         except Exception as e:
-            logger.warning(f"Check analysis failed for {home_name} vs {away_name}: {e}")
+            logger.exception("Check analysis failed for %s vs %s", home_name, away_name)
             pick["_source"] = "booking_code"
             pick["data_confidence"] = pick.get("confidence", 50)
             pick["verdict"] = "error"
@@ -3638,6 +3827,7 @@ async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
     context.user_data["check_all_scored"] = all_scored
     context.user_data["check_codes"] = valid_codes
     context.user_data["check_excluded"] = set()
+    job_success = True
 
     # Show summary of code game verdicts
     pending = [p for p in all_scored if p.get("verdict") not in ("won", "lost", "ended")]
@@ -3704,11 +3894,15 @@ async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
         reply_markup=InlineKeyboardMarkup(expand_buttons),
     )
 
+    _mark_job_finish(context, job_token, success=job_success, error=job_error)
     return CHECK_EXPAND
 
 
 async def check_expand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle expand choice: add SportyBet league picks (scored via /pick's pipeline) or code only."""
+    job_token = _mark_job_start(context, "check_expand")
+    job_success = False
+    job_error = None
     query = update.callback_query
     await query.answer()
 
@@ -3717,6 +3911,8 @@ async def check_expand_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data == "check_expand_no":
         await query.edit_message_text("🎯 Got it — working with your code games.")
+        job_success = True
+        _mark_job_finish(context, job_token, success=True)
         return await _show_check_target_odds(query.message, context, edit=False)
 
     # data == "check_expand_yes" — scan SportyBet events for user's leagues
@@ -3727,6 +3923,8 @@ async def check_expand_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if not leagues:
         await query.edit_message_text("No leagues set up yet — use /leagues to add some.\nWorking with your code games for now.")
+        job_success = True
+        _mark_job_finish(context, job_token, success=True)
         return await _show_check_target_odds(query.message, context, edit=False)
 
     await query.edit_message_text(
@@ -3757,8 +3955,10 @@ async def check_expand_callback(update: Update, context: ContextTypes.DEFAULT_TY
             continue
 
         try:
-            home_results = await asyncio.to_thread(get_team_results, home_name, count=10)
-            away_results = await asyncio.to_thread(get_team_results, away_name, count=10)
+            home_results, away_results = await asyncio.gather(
+                asyncio.to_thread(get_team_results, home_name, count=10),
+                asyncio.to_thread(get_team_results, away_name, count=10),
+            )
             if not home_results or not away_results:
                 continue
 
@@ -3873,7 +4073,7 @@ async def check_expand_callback(update: Update, context: ContextTypes.DEFAULT_TY
             scanned += 1
 
         except Exception as e:
-            logger.warning(f"Check expand error for {home_name} vs {away_name}: {e}")
+            logger.exception("Check expand error for %s vs %s", home_name, away_name)
 
     if league_scored:
         all_scored.extend(league_scored)
@@ -3886,6 +4086,8 @@ async def check_expand_callback(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         await query.message.reply_text("Nothing strong enough from the league scan — sticking with your code games.")
 
+    job_success = True
+    _mark_job_finish(context, job_token, success=job_success, error=job_error)
     return await _show_check_target_odds(query.message, context, edit=False)
 
 
@@ -4139,6 +4341,7 @@ async def post_init(application: Application):
         BotCommand("settings", "Pick settings (alias for /strategy)"),
         BotCommand("budget", "Check API calls remaining"),
         BotCommand("status", "Current bot config"),
+        BotCommand("health", "Runtime health & recent errors"),
     ]
     await application.bot.set_my_commands(commands)
     logger.info("Bot command menu registered.")
@@ -4306,7 +4509,16 @@ def main():
         print("2. Add TELEGRAM_BOT_TOKEN=your_token to .env")
         sys.exit(1)
 
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    runtime_mode = _runtime_mode_from_env()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .concurrent_updates(CONCURRENT_UPDATES)
+        .post_init(post_init)
+        .build()
+    )
+    _health_state(app)
+    app.bot_data["runtime_mode"] = runtime_mode
 
     # /check conversation handler (must be added before plain CommandHandler)
     check_conv = ConversationHandler(
@@ -4371,7 +4583,9 @@ def main():
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("budget", cmd_budget))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("timeframe", cmd_timeframe))
+    app.add_error_handler(error_handler)
 
     # Strategy/settings conversation handler
     strat_conv = ConversationHandler(
@@ -4415,12 +4629,6 @@ def main():
 
     # Natural language is now handled as a pick_conv entry point
     # (it returns ConversationHandler.END for non-pick intents)
-
-    runtime_mode = (os.getenv("BOT_MODE", "auto").strip().lower() or "auto")
-    if runtime_mode not in {"auto", "polling", "webhook"}:
-        runtime_mode = "auto"
-    if runtime_mode == "auto":
-        runtime_mode = "webhook" if os.getenv("WEBHOOK_URL", "").strip() else "polling"
 
     print("SportyBot Telegram bot starting...")
     print(f"Runtime mode: {runtime_mode}")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -58,6 +59,7 @@ _BUDGET_FILE = CACHE_DIR / "api_usage.json"
 _API_DAILY_LIMIT = 80  # Stay under 100/day with safety margin
 _last_call_time = 0.0
 _MIN_CALL_INTERVAL = 7.0  # seconds between calls (free plan: 10 req/min)
+_api_rate_limit_lock = threading.Lock()
 
 
 def _load_budget() -> dict:
@@ -123,22 +125,23 @@ def _api_get(endpoint: str, params: dict | None = None) -> dict:
         )
 
     global _last_call_time
-    budget = get_api_budget()
-    if budget["remaining"] <= 0:
-        raise RuntimeError(
-            f"API call limit reached ({_API_DAILY_LIMIT}/day). "
-            "Cached data will still work. Try again tomorrow."
-        )
+    with _api_rate_limit_lock:
+        budget = get_api_budget()
+        if budget["remaining"] <= 0:
+            raise RuntimeError(
+                f"API call limit reached ({_API_DAILY_LIMIT}/day). "
+                "Cached data will still work. Try again tomorrow."
+            )
 
-    # Rate limiting: wait between calls
-    elapsed = time.time() - _last_call_time
-    if elapsed < _MIN_CALL_INTERVAL:
-        wait = _MIN_CALL_INTERVAL - elapsed
-        print(f"    [rate limit: waiting {wait:.0f}s]", end="\r", flush=True)
-        time.sleep(wait)
+        # Rate limiting: wait between calls
+        elapsed = time.time() - _last_call_time
+        if elapsed < _MIN_CALL_INTERVAL:
+            wait = _MIN_CALL_INTERVAL - elapsed
+            print(f"    [rate limit: waiting {wait:.0f}s]", end="\r", flush=True)
+            time.sleep(wait)
 
-    _increment_budget()
-    _last_call_time = time.time()
+        _increment_budget()
+        _last_call_time = time.time()
 
     url = f"{API_FOOTBALL_BASE}/{endpoint}"
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
