@@ -12,6 +12,7 @@ import math
 import os
 import sys
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -719,7 +720,7 @@ def _default_pick_request() -> dict:
     """Default request model for the /pick flow."""
     return {
         "ticket_type": None,
-        "ticket_count": 1,
+        "ticket_count": None,
         "ticket_mode": None,
         "target_odds": None,
     }
@@ -734,11 +735,16 @@ def _ensure_pick_request(context: ContextTypes.DEFAULT_TYPE) -> dict:
     if req.get("ticket_type") not in ("single", "multiple"):
         req["ticket_type"] = None
 
-    try:
-        ticket_count = int(req.get("ticket_count", 1) or 1)
-    except (TypeError, ValueError):
-        ticket_count = 1
-    req["ticket_count"] = max(1, min(5, ticket_count))
+    raw_ticket_count = req.get("ticket_count")
+    ticket_count = None
+    if raw_ticket_count not in (None, ""):
+        try:
+            ticket_count = int(raw_ticket_count)
+        except (TypeError, ValueError):
+            ticket_count = None
+    if ticket_count is not None:
+        ticket_count = max(1, min(5, ticket_count))
+    req["ticket_count"] = ticket_count
 
     if req.get("ticket_mode") not in ("unique", "dynamic", "single"):
         req["ticket_mode"] = None
@@ -753,6 +759,8 @@ def _ensure_pick_request(context: ContextTypes.DEFAULT_TYPE) -> dict:
     if req["ticket_type"] == "single":
         req["ticket_count"] = 1
         req["ticket_mode"] = "single"
+    elif req["ticket_type"] == "multiple" and req["ticket_count"] is not None:
+        req["ticket_count"] = max(2, req["ticket_count"])
 
     context.user_data["pick_request"] = req
     return req
@@ -845,10 +853,11 @@ async def _prompt_pick_ticket_mode(message, edit: bool = False):
 async def _continue_pick_request_flow(message, context, edit: bool = False):
     """Advance the guided /pick flow until all required fields are present."""
     req = _ensure_pick_request(context)
+    ticket_count = req.get("ticket_count")
 
     if not req.get("ticket_type"):
         return await _prompt_pick_ticket_type(message, edit=edit)
-    if req["ticket_type"] == "multiple" and req.get("ticket_count", 1) < 2:
+    if req["ticket_type"] == "multiple" and (ticket_count is None or ticket_count < 2):
         return await _prompt_pick_ticket_count(message, edit=edit)
     if not req.get("target_odds"):
         return await _prompt_pick_target_odds(message, edit=edit)
@@ -995,7 +1004,7 @@ async def pick_receive_type_text(update: Update, context: ContextTypes.DEFAULT_T
     req = _ensure_pick_request(context)
     if "multi" in text:
         req["ticket_type"] = "multiple"
-        req["ticket_count"] = 2
+        req["ticket_count"] = None
         req["ticket_mode"] = None
     elif "single" in text or "one" in text:
         req["ticket_type"] = "single"
@@ -1019,7 +1028,7 @@ async def pick_receive_type_button(update: Update, context: ContextTypes.DEFAULT
         req["ticket_count"] = 1
         req["ticket_mode"] = "single"
     else:
-        req["ticket_count"] = max(2, req.get("ticket_count", 2) or 2)
+        req["ticket_count"] = None
         req["ticket_mode"] = None
     context.user_data["pick_request"] = req
     return await _continue_pick_request_flow(query.message, context, edit=True)
@@ -2392,6 +2401,101 @@ async def _book_ticket_picks(combo: list[dict]) -> dict:
     }
 
 
+async def _show_pick_change_options(message, context, idx: int, edit: bool = False, intro: str | None = None):
+    """Show alternative markets for one pick inside the current combo."""
+    combo = context.user_data.get("pick_combo", [])
+    if idx < 0 or idx >= len(combo):
+        return await _pick_build_combo(message, context)
+
+    pick = combo[idx]
+    context.user_data["pick_change_idx"] = idx
+
+    all_scored = context.user_data.get("pick_all_scored", [])
+    match_key = _match_key(pick)
+    current_pick_key = _pick_key(pick)
+
+    match_alts = [
+        p for p in all_scored
+        if _match_key(p) == match_key
+        and _pick_key(p) != current_pick_key
+        and p.get("odds", 0) > 1.0
+    ]
+    match_alts.sort(key=lambda p: p.get("confidence", 0), reverse=True)
+
+    deduped_alts = []
+    seen_alt_keys = set()
+    for alt in match_alts:
+        alt_key = _pick_key(alt)
+        if alt_key in seen_alt_keys:
+            continue
+        seen_alt_keys.add(alt_key)
+        deduped_alts.append(alt)
+    match_alts = deduped_alts[:4]
+
+    if not match_alts:
+        await _send_or_edit(
+            message,
+            "No alternative markets found for this match.\nRebuilding...",
+            edit=edit,
+        )
+        if context.user_data.get("pick_bundle_review_mode") == "ticket":
+            return await _show_pick_bundle_ticket_detail(message, context, edit=True)
+        return await _pick_build_combo(message, context)
+
+    context.user_data["pick_change_alts"] = match_alts
+
+    lines = [f"🔄 *{pick['home']} vs {pick['away']}*", ""]
+    if intro:
+        lines.append(intro)
+        lines.append("")
+    lines.append(
+        f"Current: {pick['market']}: {pick['pick']} @ {pick['odds']:.2f} "
+        f"[{pick.get('confidence', '?')}%]"
+    )
+    lines.append("")
+    lines.append("Best alternatives by analysis:")
+
+    buttons = []
+    for alt_idx, alt in enumerate(match_alts):
+        conf = alt.get("confidence", 0)
+        odds = alt.get("odds", 0)
+        market = alt.get("market", "")
+        pick_str = alt.get("pick", "")
+
+        if market == "Over/Under":
+            threshold = _pick_threshold(alt)
+            label = f"Over {threshold}" if threshold else pick_str
+        elif market == "1X2":
+            label = f"{pick_str} Win" if pick_str in ("Home", "Away") else pick_str
+        elif market == "GG/NG":
+            label = "BTTS Yes" if pick_str == "GG" else pick_str
+        elif market == "HT Over/Under":
+            threshold = _pick_threshold(alt)
+            label = f"HT Over {threshold}" if threshold else f"HT {pick_str}"
+        else:
+            label = f"{market}: {pick_str}"
+
+        display = f"{label} @ {odds:.2f} [{conf}%]"
+        lines.append(f"  {display}")
+
+        reasons = alt.get("analysis_reasons", [])
+        if reasons:
+            lines.append(f"    ↳ {reasons[0]}")
+
+        buttons.append([InlineKeyboardButton(display, callback_data=f"pick_mkt_{idx}_alt_{alt_idx}")])
+
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="pick_mkt_back")])
+
+    await _send_or_edit(
+        message,
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        edit=edit,
+        parse_mode="Markdown",
+    )
+    return PICK_REVIEW
+
+
 async def pick_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle exclude/reshuffle/confirm buttons in pick flow."""
     query = update.callback_query
@@ -2461,114 +2565,17 @@ async def pick_review_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif data.startswith("pick_swap_"):
         idx = int(data.replace("pick_swap_", ""))
-        combo = context.user_data.get("pick_combo", [])
-        if 0 <= idx < len(combo):
-            pick = combo[idx]
-            suggestion = pick.get("suggestion")
-            if suggestion:
-                old_desc = f"{pick['market']}: {pick['pick']}"
-                # Apply the suggestion — update market and pick, keep the same match
-                pick["market"] = suggestion["market"]
-                pick["pick"] = suggestion["market"]  # suggestion market IS the pick name
-                pick["confidence"] = suggestion["confidence"]
-                pick["data_confidence"] = suggestion["confidence"]
-                pick["verdict"] = _confidence_verdict(suggestion["confidence"])
-                pick["suggestion"] = None  # clear after swap
-                # Odds aren't provided by suggestion; estimate lower for safer picks
-                if pick["odds"] > 1.5:
-                    pick["odds"] = max(1.10, pick["odds"] * 0.75)
-                await query.edit_message_text(
-                    f"💡 Swapped #{idx+1}: {old_desc}\n"
-                    f"   → {pick['market']}: {pick['pick']} @ ~{pick['odds']:.2f}\nRebuilding..."
-                )
-            else:
-                await query.edit_message_text("No suggestion available for this pick.\nRebuilding...")
-        if bundle_mode == "ticket":
-            _sync_active_bundle_ticket_from_combo(context)
-            return await _show_pick_bundle_ticket_detail(query.message, context, edit=True)
-        return await _pick_build_combo(query.message, context)
+        return await _show_pick_change_options(
+            query.message,
+            context,
+            idx,
+            edit=True,
+            intro="Swap suggestions now open the market picker so you can choose the best replacement.",
+        )
 
     elif data.startswith("pick_change_"):
         idx = int(data.replace("pick_change_", ""))
-        combo = context.user_data.get("pick_combo", [])
-        if 0 <= idx < len(combo):
-            pick = combo[idx]
-            context.user_data["pick_change_idx"] = idx
-
-            # Find ALL scored alternatives for this same match from the analysis
-            all_scored = context.user_data.get("pick_all_scored", [])
-            match_key = f"{pick['home']}_{pick['away']}"
-            current_pick_key = _pick_key(pick)
-
-            match_alts = [
-                p for p in all_scored
-                if f"{p['home']}_{p['away']}" == match_key
-                and _pick_key(p) != current_pick_key
-                and p.get("odds", 0) > 1.0
-            ]
-
-            # Sort by real scorer confidence (not implied odds), take top 4
-            match_alts.sort(key=lambda p: p.get("confidence", 0), reverse=True)
-            match_alts = match_alts[:4]
-
-            lines = [f"🔄 *{pick['home']} vs {pick['away']}*\n"]
-            lines.append(f"Current: {pick['market']}: {pick['pick']} @ {pick['odds']:.2f} [{pick.get('confidence', '?')}%]\n")
-            lines.append("Best alternatives by analysis:")
-
-            # Get SportyBet event for callback data mapping
-            sporty_event = pick.get("_sporty_event")
-            if not sporty_event:
-                sporty_event = await asyncio.to_thread(find_event, pick["home"], pick["away"])
-
-            # Store alternatives so the handler can look them up by index
-            context.user_data["pick_change_alts"] = match_alts
-
-            buttons = []
-            for alt_idx, alt in enumerate(match_alts):
-                conf = alt.get("confidence", 0)
-                odds = alt.get("odds", 0)
-                market = alt.get("market", "")
-                pick_str = alt.get("pick", "")
-
-                # Build a readable label
-                if market == "Over/Under":
-                    t = _pick_threshold(alt)
-                    label = f"Over {t}" if t else pick_str
-                elif market == "1X2":
-                    label = f"{pick_str} Win" if pick_str in ("Home", "Away") else pick_str
-                elif market == "GG/NG":
-                    label = "BTTS Yes" if pick_str == "GG" else pick_str
-                elif market == "HT Over/Under":
-                    t = _pick_threshold(alt)
-                    label = f"HT Over {t}" if t else f"HT {pick_str}"
-                else:
-                    label = f"{market}: {pick_str}"
-
-                display = f"{label} @ {odds:.2f} [{conf}%]"
-                lines.append(f"  {display}")
-
-                # Generic callback: pick_mkt_{combo_idx}_alt_{alt_idx}
-                cb = f"pick_mkt_{idx}_alt_{alt_idx}"
-
-                # Top reason from analysis
-                reasons = alt.get("analysis_reasons", [])
-                if reasons:
-                    lines.append(f"    ↳ {reasons[0]}")
-
-                buttons.append([InlineKeyboardButton(display, callback_data=cb)])
-
-            if not buttons:
-                await query.edit_message_text("No alternative markets found for this match.\nRebuilding...")
-                return await _pick_build_combo(query.message, context)
-
-            buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="pick_mkt_back")])
-
-            await query.edit_message_text(
-                "\n".join(lines),
-                reply_markup=InlineKeyboardMarkup(buttons),
-                parse_mode="Markdown",
-            )
-        return PICK_REVIEW
+        return await _show_pick_change_options(query.message, context, idx, edit=True)
 
     elif data.startswith("pick_mkt_"):
         # Handle market selection for a specific pick
@@ -4409,8 +4416,52 @@ def main():
     # Natural language is now handled as a pick_conv entry point
     # (it returns ConversationHandler.END for non-pick intents)
 
+    runtime_mode = (os.getenv("BOT_MODE", "auto").strip().lower() or "auto")
+    if runtime_mode not in {"auto", "polling", "webhook"}:
+        runtime_mode = "auto"
+    if runtime_mode == "auto":
+        runtime_mode = "webhook" if os.getenv("WEBHOOK_URL", "").strip() else "polling"
+
     print("SportyBot Telegram bot starting...")
+    print(f"Runtime mode: {runtime_mode}")
     print(f"API Budget: {get_api_budget()['remaining']} calls remaining")
+
+    if runtime_mode == "webhook":
+        raw_webhook_url = os.getenv("WEBHOOK_URL", "").strip()
+        if not raw_webhook_url:
+            print("Error: WEBHOOK_URL is required when BOT_MODE=webhook")
+            sys.exit(1)
+
+        parsed = urlparse(raw_webhook_url)
+        if not parsed.scheme or not parsed.netloc:
+            print("Error: WEBHOOK_URL must be a full URL like https://your-app.example.com/telegram")
+            sys.exit(1)
+
+        try:
+            port = int(os.getenv("PORT", "8080") or 8080)
+        except ValueError:
+            print("Error: PORT must be an integer")
+            sys.exit(1)
+
+        listen = os.getenv("LISTEN", "0.0.0.0").strip() or "0.0.0.0"
+        url_path = parsed.path.lstrip("/") or "telegram"
+        webhook_url = raw_webhook_url.rstrip("/")
+        if parsed.path in ("", "/"):
+            webhook_url = f"{webhook_url}/{url_path}"
+        secret_token = os.getenv("WEBHOOK_SECRET", "").strip() or None
+
+        print(f"Webhook listen: {listen}:{port}")
+        print(f"Webhook URL: {webhook_url}")
+        app.run_webhook(
+            listen=listen,
+            port=port,
+            url_path=url_path,
+            webhook_url=webhook_url,
+            secret_token=secret_token,
+            allowed_updates=Update.ALL_TYPES,
+        )
+        return
+
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

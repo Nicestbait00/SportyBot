@@ -1,4 +1,4 @@
 #!/bin/bash
-cd ~/sportybot
-openclaw gateway start
-
+set -euo pipefail
+cd "$(dirname "$0")"
+exec python3 telegram_bot.py
