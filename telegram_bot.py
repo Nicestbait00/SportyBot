@@ -33,6 +33,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 from config import (
     AVAILABLE_MARKETS,
     DEFAULT_ENABLED_MARKETS,
+    LEAGUE_CATEGORIES,
     LEAGUE_NAMES,
     LEAGUES,
     STRATEGY_PRESETS,
@@ -57,7 +58,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 # Conversation states for /check flow
 CHECK_CODES, CHECK_TARGET_ODDS, CHECK_EXCLUDE, CHECK_CONFIRM, CHECK_EXPAND, CHECK_REVIEW = range(6)
 # Conversation states for /pick flow
-PICK_ODDS, PICK_REVIEW = range(10, 12)
+PICK_TYPE, PICK_COUNT, PICK_ODDS, PICK_MODE, PICK_REVIEW = range(10, 15)
 # Conversation states for /strategy custom flow
 STRAT_CUSTOM_CONFIDENCE, STRAT_CUSTOM_MARKETS, STRAT_CUSTOM_OVER, STRAT_CUSTOM_MIN_ODDS = range(20, 24)
 
@@ -601,6 +602,264 @@ def _get_strategy_label(user_config: dict) -> str:
     return _get_config_label(user_config)
 
 
+def _build_league_keyboard(active: set[int]) -> InlineKeyboardMarkup:
+    """Build the league picker keyboard with category shortcuts."""
+    buttons = []
+
+    category_row = []
+    for key, category in LEAGUE_CATEGORIES.items():
+        category_ids = set(category["league_ids"])
+        enabled = bool(category_ids) and category_ids.issubset(active)
+        category_row.append(
+            InlineKeyboardButton(
+                f"{'✅' if enabled else '⬜'} {category['label']}",
+                callback_data=f"league_cat_{key}",
+            )
+        )
+    if category_row:
+        buttons.append(category_row)
+
+    for category in LEAGUE_CATEGORIES.values():
+        row = []
+        for lid in category["league_ids"]:
+            name = LEAGUE_NAMES.get(lid, str(lid))
+            check = "✅" if lid in active else "⬜"
+            row.append(
+                InlineKeyboardButton(
+                    f"{check} {name}",
+                    callback_data=f"league_toggle_{lid}",
+                )
+            )
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+    categorized = {
+        lid
+        for category in LEAGUE_CATEGORIES.values()
+        for lid in category["league_ids"]
+    }
+    other_leagues = sorted(
+        (
+            (lid, name)
+            for lid, name in LEAGUE_NAMES.items()
+            if lid not in categorized
+        ),
+        key=lambda item: item[1],
+    )
+
+    row = []
+    for lid, name in other_leagues:
+        check = "✅" if lid in active else "⬜"
+        row.append(
+            InlineKeyboardButton(
+                f"{check} {name}",
+                callback_data=f"league_toggle_{lid}",
+            )
+        )
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    buttons.append(
+        [
+            InlineKeyboardButton("🧹 Clear All", callback_data="league_clear_all"),
+            InlineKeyboardButton("✅ Done", callback_data="league_done"),
+        ]
+    )
+    return InlineKeyboardMarkup(buttons)
+
+
+def _format_league_selection_text(active: set[int]) -> str:
+    """Render a short summary for the league picker."""
+    preset_lines = []
+    for category in LEAGUE_CATEGORIES.values():
+        preset_lines.append(f"{category['label']}: {category['description']}")
+
+    active_names = [LEAGUE_NAMES.get(lid, str(lid)) for lid in sorted(active)]
+    active_summary = ", ".join(active_names) if active_names else "None selected yet"
+
+    return (
+        "Select leagues to analyze.\n"
+        "Quick presets:\n"
+        + "\n".join(preset_lines)
+        + f"\n\nActive: {active_summary}\n"
+        "Tap a category or individual leagues."
+    )
+
+
+def _clear_pick_runtime(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear transient /pick state."""
+    for key in [
+        "pick_all_scored",
+        "pick_combo",
+        "pick_target",
+        "pick_excluded",
+        "pick_shuffle_seed",
+        "_pick_msg",
+        "pick_market_slots",
+        "pick_request",
+        "pick_bundle",
+        "pick_bundle_mode",
+        "pick_bundle_fallback",
+        "pick_bundle_review_mode",
+        "pick_bundle_allow_reuse",
+        "active_ticket_index",
+        "pick_change_idx",
+        "pick_change_alts",
+    ]:
+        context.user_data.pop(key, None)
+
+
+def _default_pick_request() -> dict:
+    """Default request model for the /pick flow."""
+    return {
+        "ticket_type": None,
+        "ticket_count": 1,
+        "ticket_mode": None,
+        "target_odds": None,
+    }
+
+
+def _ensure_pick_request(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """Load and normalize the in-progress pick request."""
+    req = context.user_data.get("pick_request")
+    if not isinstance(req, dict):
+        req = _default_pick_request()
+
+    if req.get("ticket_type") not in ("single", "multiple"):
+        req["ticket_type"] = None
+
+    try:
+        ticket_count = int(req.get("ticket_count", 1) or 1)
+    except (TypeError, ValueError):
+        ticket_count = 1
+    req["ticket_count"] = max(1, min(5, ticket_count))
+
+    if req.get("ticket_mode") not in ("unique", "dynamic", "single"):
+        req["ticket_mode"] = None
+
+    target = req.get("target_odds")
+    if target is not None:
+        try:
+            req["target_odds"] = float(target)
+        except (TypeError, ValueError):
+            req["target_odds"] = None
+
+    if req["ticket_type"] == "single":
+        req["ticket_count"] = 1
+        req["ticket_mode"] = "single"
+
+    context.user_data["pick_request"] = req
+    return req
+
+
+async def _send_or_edit(message, text: str, reply_markup=None, edit: bool = False, parse_mode=None):
+    """Reply or edit a Telegram message depending on context."""
+    if edit and hasattr(message, "edit_text"):
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    else:
+        await message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+
+
+async def _prompt_pick_ticket_type(message, edit: bool = False):
+    """Ask whether the user wants a single or multiple tickets."""
+    buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Single Ticket", callback_data="pick_type_single"),
+            InlineKeyboardButton("Multiple Tickets", callback_data="pick_type_multiple"),
+        ]
+    ])
+    await _send_or_edit(
+        message,
+        "🎫 What do you want to build?\nChoose a single ticket or a multi-ticket bundle.",
+        reply_markup=buttons,
+        edit=edit,
+    )
+    return PICK_TYPE
+
+
+async def _prompt_pick_ticket_count(message, edit: bool = False):
+    """Ask how many tickets to generate."""
+    buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("2", callback_data="pick_count_2"),
+            InlineKeyboardButton("3", callback_data="pick_count_3"),
+            InlineKeyboardButton("4", callback_data="pick_count_4"),
+            InlineKeyboardButton("5", callback_data="pick_count_5"),
+        ]
+    ])
+    await _send_or_edit(
+        message,
+        "🔢 How many tickets do you want?\nPick between 2 and 5.",
+        reply_markup=buttons,
+        edit=edit,
+    )
+    return PICK_COUNT
+
+
+async def _prompt_pick_target_odds(message, edit: bool = False):
+    """Ask for target odds per ticket."""
+    buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("3 odds", callback_data="pick_target_3"),
+            InlineKeyboardButton("5 odds", callback_data="pick_target_5"),
+            InlineKeyboardButton("10 odds", callback_data="pick_target_10"),
+        ],
+        [
+            InlineKeyboardButton("15 odds", callback_data="pick_target_15"),
+            InlineKeyboardButton("20 odds", callback_data="pick_target_20"),
+            InlineKeyboardButton("50 odds", callback_data="pick_target_50"),
+        ],
+    ])
+    await _send_or_edit(
+        message,
+        "🎯 What odds are you targeting per ticket?\nPick below or type a custom number.",
+        reply_markup=buttons,
+        edit=edit,
+    )
+    return PICK_ODDS
+
+
+async def _prompt_pick_ticket_mode(message, edit: bool = False):
+    """Ask how a multi-ticket bundle should be generated."""
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Unique Tickets", callback_data="pick_mode_unique")],
+        [InlineKeyboardButton("Dynamic Tickets", callback_data="pick_mode_dynamic")],
+    ])
+    await _send_or_edit(
+        message,
+        "🧠 How should the bundle work?\n"
+        "Unique tickets = same games, different markets.\n"
+        "Dynamic tickets = different games across tickets.",
+        reply_markup=buttons,
+        edit=edit,
+    )
+    return PICK_MODE
+
+
+async def _continue_pick_request_flow(message, context, edit: bool = False):
+    """Advance the guided /pick flow until all required fields are present."""
+    req = _ensure_pick_request(context)
+
+    if not req.get("ticket_type"):
+        return await _prompt_pick_ticket_type(message, edit=edit)
+    if req["ticket_type"] == "multiple" and req.get("ticket_count", 1) < 2:
+        return await _prompt_pick_ticket_count(message, edit=edit)
+    if not req.get("target_odds"):
+        return await _prompt_pick_target_odds(message, edit=edit)
+    if req["ticket_type"] == "multiple" and req.get("ticket_mode") not in ("unique", "dynamic"):
+        return await _prompt_pick_ticket_mode(message, edit=edit)
+
+    context.user_data["pick_target"] = float(req["target_odds"])
+    context.user_data["pick_bundle_mode"] = req.get("ticket_mode", "single")
+    return await _pick_analyze_from_message(message, context, float(req["target_odds"]))
+
+
 # ── Command handlers ─────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -646,24 +905,9 @@ async def cmd_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_user_config(chat_id=chat_id)
     active = set(config.get("leagues", []))
 
-    buttons = []
-    row = []
-    for lid, name in sorted(LEAGUE_NAMES.items(), key=lambda x: x[1]):
-        check = "✅" if lid in active else "⬜"
-        row.append(InlineKeyboardButton(
-            f"{check} {name}", callback_data=f"league_toggle_{lid}"
-        ))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-
-    buttons.append([InlineKeyboardButton("✅ Done", callback_data="league_done")])
-
     await update.message.reply_text(
-        "Select leagues to analyze:\n(Tap to toggle on/off)",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        _format_league_selection_text(active),
+        reply_markup=_build_league_keyboard(active),
     )
 
 
@@ -677,74 +921,134 @@ async def callback_league_toggle(update: Update, context: ContextTypes.DEFAULT_T
     if data == "league_done":
         config = load_user_config(chat_id=chat_id)
         names = [LEAGUE_NAMES.get(lid, str(lid)) for lid in config["leagues"]]
+        active = set(config.get("leagues", []))
+        preset_hits = [
+            category["label"]
+            for category in LEAGUE_CATEGORIES.values()
+            if set(category["league_ids"]).issubset(active)
+        ]
+        preset_line = f"Presets active: {', '.join(preset_hits)}\n" if preset_hits else ""
         await query.edit_message_text(
+            preset_line +
             f"Leagues set: {', '.join(names) or 'None'}\n\n"
             "Now run /refresh to cache data, then /pick to get selections.",
         )
         return
 
-    lid = int(data.replace("league_toggle_", ""))
     config = load_user_config(chat_id=chat_id)
-    leagues = config.get("leagues", [])
+    leagues = list(config.get("leagues", []))
 
-    if lid in leagues:
-        leagues.remove(lid)
+    if data == "league_clear_all":
+        leagues = []
+    elif data.startswith("league_cat_"):
+        category_key = data.replace("league_cat_", "")
+        category = LEAGUE_CATEGORIES.get(category_key)
+        if category:
+            category_ids = category["league_ids"]
+            if all(lid in leagues for lid in category_ids):
+                leagues = [lid for lid in leagues if lid not in category_ids]
+            else:
+                leagues = list(dict.fromkeys(leagues + category_ids))
     else:
-        leagues.append(lid)
+        lid = int(data.replace("league_toggle_", ""))
+        if lid in leagues:
+            leagues.remove(lid)
+        else:
+            leagues.append(lid)
 
     config["leagues"] = leagues
     save_user_config(config, chat_id=chat_id)
 
     active = set(leagues)
-    buttons = []
-    row = []
-    for league_id, name in sorted(LEAGUE_NAMES.items(), key=lambda x: x[1]):
-        check = "✅" if league_id in active else "⬜"
-        row.append(InlineKeyboardButton(
-            f"{check} {name}", callback_data=f"league_toggle_{league_id}"
-        ))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton("✅ Done", callback_data="league_done")])
-
-    await query.edit_message_reply_markup(InlineKeyboardMarkup(buttons))
+    await query.edit_message_text(
+        _format_league_selection_text(active),
+        reply_markup=_build_league_keyboard(active),
+    )
 
 
 async def pick_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start interactive pick flow. If odds given inline, skip to analysis."""
+    """Start the guided /pick flow."""
+    _clear_pick_runtime(context)
     context.user_data["chat_id"] = update.effective_chat.id
     args = context.args or []
+    req = _ensure_pick_request(context)
 
     if args:
         try:
             target = float(args[0])
+            req["ticket_type"] = "single"
+            req["ticket_count"] = 1
+            req["ticket_mode"] = "single"
+            req["target_odds"] = target
+            context.user_data["pick_request"] = req
             context.user_data["pick_target"] = target
-            return await _pick_analyze(update, context, target)
+            return await _continue_pick_request_flow(update.message, context)
         except ValueError:
             pass
 
-    # Ask for target odds
-    buttons = [
-        [
-            InlineKeyboardButton("3 odds", callback_data="pick_target_3"),
-            InlineKeyboardButton("5 odds", callback_data="pick_target_5"),
-            InlineKeyboardButton("10 odds", callback_data="pick_target_10"),
-        ],
-        [
-            InlineKeyboardButton("15 odds", callback_data="pick_target_15"),
-            InlineKeyboardButton("20 odds", callback_data="pick_target_20"),
-            InlineKeyboardButton("50 odds", callback_data="pick_target_50"),
-        ],
-    ]
-    await update.message.reply_text(
-        "🎯 What total odds are you targeting?\n"
-        "Pick below or type a custom number:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-    return PICK_ODDS
+    return await _continue_pick_request_flow(update.message, context)
+
+
+async def pick_receive_type_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive ticket type as free text."""
+    text = update.message.text.strip().lower()
+    req = _ensure_pick_request(context)
+    if "multi" in text:
+        req["ticket_type"] = "multiple"
+        req["ticket_count"] = 2
+        req["ticket_mode"] = None
+    elif "single" in text or "one" in text:
+        req["ticket_type"] = "single"
+        req["ticket_count"] = 1
+        req["ticket_mode"] = "single"
+    else:
+        await update.message.reply_text("Reply with `single` or `multiple`, or tap a button.", parse_mode="Markdown")
+        return PICK_TYPE
+    context.user_data["pick_request"] = req
+    return await _continue_pick_request_flow(update.message, context)
+
+
+async def pick_receive_type_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive ticket type from button."""
+    query = update.callback_query
+    await query.answer()
+    req = _ensure_pick_request(context)
+    ticket_type = query.data.replace("pick_type_", "")
+    req["ticket_type"] = ticket_type
+    if ticket_type == "single":
+        req["ticket_count"] = 1
+        req["ticket_mode"] = "single"
+    else:
+        req["ticket_count"] = max(2, req.get("ticket_count", 2) or 2)
+        req["ticket_mode"] = None
+    context.user_data["pick_request"] = req
+    return await _continue_pick_request_flow(query.message, context, edit=True)
+
+
+async def pick_receive_count_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive ticket count as free text."""
+    try:
+        count = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("Send a number from 2 to 5, or tap a button.")
+        return PICK_COUNT
+    if count < 2 or count > 5:
+        await update.message.reply_text("Ticket bundles are capped between 2 and 5.")
+        return PICK_COUNT
+    req = _ensure_pick_request(context)
+    req["ticket_count"] = count
+    context.user_data["pick_request"] = req
+    return await _continue_pick_request_flow(update.message, context)
+
+
+async def pick_receive_count_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive ticket count from button."""
+    query = update.callback_query
+    await query.answer()
+    req = _ensure_pick_request(context)
+    req["ticket_count"] = int(query.data.replace("pick_count_", ""))
+    context.user_data["pick_request"] = req
+    return await _continue_pick_request_flow(query.message, context, edit=True)
 
 
 async def pick_receive_odds_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -754,8 +1058,11 @@ async def pick_receive_odds_text(update: Update, context: ContextTypes.DEFAULT_T
     except ValueError:
         await update.message.reply_text("Send a number (e.g. 10) or /cancel.")
         return PICK_ODDS
+    req = _ensure_pick_request(context)
+    req["target_odds"] = target
+    context.user_data["pick_request"] = req
     context.user_data["pick_target"] = target
-    return await _pick_analyze(update, context, target)
+    return await _continue_pick_request_flow(update.message, context)
 
 
 async def pick_receive_odds_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -763,11 +1070,36 @@ async def pick_receive_odds_button(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     target = float(query.data.replace("pick_target_", ""))
+    req = _ensure_pick_request(context)
+    req["target_odds"] = target
+    context.user_data["pick_request"] = req
     context.user_data["pick_target"] = target
-    await query.edit_message_text(f"🎯 Target: {target:.0f} odds. Scanning...")
-    # We need to use query.message for replies from here
-    context.user_data["_pick_msg"] = query.message
-    return await _pick_analyze_from_message(query.message, context, target)
+    return await _continue_pick_request_flow(query.message, context, edit=True)
+
+
+async def pick_receive_mode_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive multi-ticket mode as free text."""
+    text = update.message.text.strip().lower()
+    req = _ensure_pick_request(context)
+    if "unique" in text:
+        req["ticket_mode"] = "unique"
+    elif "dynamic" in text or "different" in text:
+        req["ticket_mode"] = "dynamic"
+    else:
+        await update.message.reply_text("Reply with `unique` or `dynamic`, or tap a button.", parse_mode="Markdown")
+        return PICK_MODE
+    context.user_data["pick_request"] = req
+    return await _continue_pick_request_flow(update.message, context)
+
+
+async def pick_receive_mode_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive multi-ticket mode from button."""
+    query = update.callback_query
+    await query.answer()
+    req = _ensure_pick_request(context)
+    req["ticket_mode"] = query.data.replace("pick_mode_", "")
+    context.user_data["pick_request"] = req
+    return await _continue_pick_request_flow(query.message, context, edit=True)
 
 
 async def _pick_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, target: float):
@@ -1155,271 +1487,706 @@ def _pick_threshold(p: dict) -> float | None:
     return None
 
 
-async def _pick_build_combo(message, context):
-    """Build best combo from scored picks, respecting exclusions and strategy."""
-    import random
+def _is_safe_team_total_pick(p: dict) -> bool:
+    """Return True for low-line team total markets we want to surface more often."""
+    market = p.get("market", "")
+    threshold = _pick_threshold(p)
+    return market in {"Home Over/Under", "Away Over/Under"} and threshold in (0.5, 1.5)
 
-    all_scored = context.user_data.get("pick_all_scored", [])
-    excluded = context.user_data.get("pick_excluded", set())
-    target = context.user_data.get("pick_target", 10)
-    shuffle_seed = context.user_data.get("pick_shuffle_seed", 0)
 
-    # Load user config (new config system)
-    chat_id = context.user_data.get("chat_id")
-    config = load_user_config(chat_id=chat_id)
-    pick_cfg = _get_pick_config(config)
-    min_confidence = pick_cfg.get("min_confidence", 75)
-    preferred_markets = pick_cfg.get("preferred_markets", DEFAULT_ENABLED_MARKETS)
-    min_pick_odds = pick_cfg.get("min_odds", 1.05)
+def _pick_selection_score(p: dict) -> float:
+    """Score a pick for combo ordering, with a bias toward safer goal markets."""
+    conf = float(p.get("data_confidence", p.get("confidence", 50)) or 50)
+    odds = float(p.get("odds", 1.0) or 1.0)
+    market = p.get("market", "")
+    threshold = _pick_threshold(p)
 
-    # Filter out excluded and odds-only picks (no real form data)
+    bonus = 0.0
+    if market in {"Home Over/Under", "Away Over/Under"}:
+        if threshold == 0.5:
+            bonus += 10.0
+        elif threshold == 1.5:
+            bonus += 6.0
+    elif market == "Over/Under":
+        if threshold == 0.5:
+            bonus += 4.0
+        elif threshold == 1.5:
+            bonus += 2.0
+    elif market == "Double Chance":
+        bonus += 3.0
+    elif market == "Draw No Bet":
+        bonus += 2.0
+
+    odds_penalty = max(0.0, odds - 1.8) * 6.0
+    return conf + bonus - odds_penalty
+
+
+def _pick_qualifies_for_combo(p: dict, min_confidence: int, min_pick_odds: float) -> bool:
+    """Apply combo thresholds, with a small allowance for very safe team totals."""
+    odds = float(p.get("odds", 0) or 0)
+    if p.get("data_quality") == "limited" or odds < min_pick_odds:
+        return False
+
+    conf = int(p.get("data_confidence", p.get("confidence", 50)) or 50)
+    if conf >= min_confidence:
+        return True
+
+    if not _is_safe_team_total_pick(p):
+        return False
+
+    threshold = _pick_threshold(p)
+    if threshold == 0.5 and odds <= 1.55:
+        return conf >= max(55, min_confidence - 7)
+    if threshold == 1.5 and odds <= 1.80:
+        return conf >= max(60, min_confidence - 5)
+    return False
+
+
+def _match_key(p: dict) -> str:
+    """Stable match identifier for scored picks."""
+    return f"{p.get('home', '')}_{p.get('away', '')}"
+
+
+def _ticket_totals(picks: list[dict]) -> tuple[float, int]:
+    """Return total odds and average confidence for a ticket."""
+    total_odds = 1.0
+    total_conf = 0
+    for pick in picks:
+        total_odds *= float(pick.get("odds", 1.0) or 1.0)
+        total_conf += int(pick.get("data_confidence", pick.get("confidence", 50)) or 50)
+    avg_conf = int(total_conf / max(len(picks), 1))
+    return round(total_odds, 2), avg_conf
+
+
+def _make_ticket_entry(
+    ticket_id: int,
+    mode: str,
+    target_odds: float,
+    picks: list[dict],
+    fallback_notes: list[str] | None = None,
+    reused_fixtures: bool = False,
+    excluded_pick_keys: set[str] | None = None,
+) -> dict:
+    """Build the runtime ticket object stored in pick_bundle."""
+    total_odds, avg_conf = _ticket_totals(picks)
+    notes = list(fallback_notes or [])
+    return {
+        "id": ticket_id,
+        "mode": mode,
+        "target_odds": target_odds,
+        "picks": [dict(p) for p in picks],
+        "total_odds": total_odds,
+        "avg_confidence": avg_conf,
+        "fallback_applied": bool(notes),
+        "fallback_notes": notes,
+        "reused_fixtures": reused_fixtures,
+        "_excluded_pick_keys": set(excluded_pick_keys or set()),
+    }
+
+
+def _build_fallback_profiles(pick_cfg: dict) -> list[dict]:
+    """Build ordered soft-fallback profiles for bundle generation."""
+    base_conf = int(pick_cfg.get("min_confidence", 75))
+    base_odds = float(pick_cfg.get("min_odds", 1.05))
+    base_markets = list(dict.fromkeys(pick_cfg.get("preferred_markets", DEFAULT_ENABLED_MARKETS)))
+    conf_floor = max(55, base_conf - 15)
+    safe_market_order = ["Home Over/Under", "Away Over/Under", "Double Chance", "Draw No Bet", "Over/Under"]
+
+    profiles = []
+    seen = set()
+
+    def add_profile(min_conf: int, min_odds: float, markets: list[str], notes: list[str]):
+        key = (min_conf, round(min_odds, 2), tuple(markets))
+        if key in seen:
+            return
+        seen.add(key)
+        profiles.append({
+            "min_confidence": min_conf,
+            "min_odds": round(min_odds, 2),
+            "preferred_markets": list(markets),
+            "notes": list(notes),
+        })
+
+    add_profile(base_conf, base_odds, base_markets, [])
+
+    current_conf = base_conf
+    while current_conf > conf_floor:
+        current_conf = max(conf_floor, current_conf - 5)
+        add_profile(
+            current_conf,
+            base_odds,
+            base_markets,
+            [f"Min confidence lowered to {current_conf}%"],
+        )
+
+    current_odds = base_odds
+    current_conf = max(conf_floor, current_conf)
+    while current_odds > 1.05 + 1e-9:
+        current_odds = max(1.05, round(current_odds - 0.05, 2))
+        add_profile(
+            current_conf,
+            current_odds,
+            base_markets,
+            [
+                f"Min confidence lowered to {current_conf}%",
+                f"Min odds lowered to {current_odds:.2f}",
+            ],
+        )
+
+    expanded = list(base_markets)
+    expansion_notes = [
+        f"Min confidence lowered to {current_conf}%",
+        f"Min odds lowered to {current_odds:.2f}",
+    ]
+    for market in safe_market_order:
+        if market in expanded:
+            continue
+        expanded.append(market)
+        add_profile(
+            current_conf,
+            current_odds,
+            expanded,
+            expansion_notes + [f"Added market: {market}"],
+        )
+
+    return profiles
+
+
+def _build_qualified_pool(
+    all_scored: list[dict],
+    excluded: set[str],
+    pick_cfg: dict,
+    market_slots: list[dict] | None = None,
+    shuffle_seed: int = 0,
+) -> list[dict]:
+    """Filter and sort the scored pool using an effective config."""
     available = [
         p for p in all_scored
         if _pick_key(p) not in excluded and p.get("data_quality") != "limited"
     ]
 
-    # Check for market_slots (natural language structured request)
-    market_slots = context.user_data.get("pick_market_slots")
+    preferred_markets = pick_cfg.get("preferred_markets", DEFAULT_ENABLED_MARKETS)
+    min_confidence = pick_cfg.get("min_confidence", 75)
+    min_pick_odds = pick_cfg.get("min_odds", 1.05)
 
-    if market_slots:
-        # Natural language request — skip config filters entirely
-        # The user explicitly told us what they want
-        pass
-    else:
-        # Apply market filter from config
-        def _market_allowed(p):
-            market = p.get("market", "")
-            return market in preferred_markets
-        available = [p for p in available if _market_allowed(p)]
+    if not market_slots:
+        available = [p for p in available if p.get("market", "") in preferred_markets]
 
-    # Sort by confidence, with slight randomness on reshuffle
     if shuffle_seed > 0:
+        import random
         rng = random.Random(shuffle_seed)
-        available.sort(key=lambda p: p["confidence"] + rng.randint(-8, 8), reverse=True)
+        available.sort(
+            key=lambda p: _pick_selection_score(p) + rng.uniform(-4.0, 4.0),
+            reverse=True,
+        )
     else:
-        available.sort(key=lambda p: p["confidence"], reverse=True)
+        available.sort(key=_pick_selection_score, reverse=True)
 
-    # Build combo: filter by config thresholds only when no market_slots
     if market_slots:
-        # Trust the user's explicit request — only filter out bad data
-        qualified = [
+        return [
             p for p in available
-            if p.get("data_quality") != "limited"
-            and p.get("odds", 0) > 1.0
+            if p.get("odds", 0) > 1.0 and p.get("data_quality") != "limited"
         ]
-    else:
-        qualified = [
-            p for p in available
-            if p["confidence"] >= min_confidence
-            and p.get("data_quality") != "limited"
-            and p.get("odds", 0) >= min_pick_odds
-        ]
+
+    return [
+        p for p in available
+        if _pick_qualifies_for_combo(p, min_confidence, min_pick_odds)
+    ]
+
+
+def _select_ticket_from_pool(
+    qualified: list[dict],
+    target: float,
+    market_slots: list[dict] | None = None,
+    disallowed_match_keys: set[str] | None = None,
+) -> list[dict]:
+    """Build one ticket from a qualified pool using the existing greedy selector."""
+    disallowed_match_keys = disallowed_match_keys or set()
 
     selected = []
     used_matches = set()
     current_odds = 1.0
 
-    # Check for market_slots (structured distribution request)
-    market_slots = context.user_data.get("pick_market_slots")
-
     if market_slots:
-        # Phase 1: Fill each fixed slot (those with "count")
         for slot in market_slots:
             if slot.get("fill"):
-                continue  # Handle fill slots last
+                continue
             slot_market = slot["market"]
             slot_count = slot.get("count", 1)
             slot_threshold = slot.get("threshold")
 
-            # Filter qualified picks for this slot
             slot_picks = [
                 p for p in qualified
                 if p["market"] == slot_market
-                and f"{p['home']}_{p['away']}" not in used_matches
+                and _match_key(p) not in used_matches
+                and _match_key(p) not in disallowed_match_keys
             ]
-
-            # For Over/Under, filter by threshold
             if slot_market == "Over/Under" and slot_threshold is not None:
-                slot_picks = [
-                    p for p in slot_picks
-                    if _pick_threshold(p) == slot_threshold
-                ]
+                slot_picks = [p for p in slot_picks if _pick_threshold(p) == slot_threshold]
 
-            # Sort by confidence
-            slot_picks.sort(key=lambda p: p["confidence"], reverse=True)
-
-            for p in slot_picks[:slot_count]:
-                match_key = f"{p['home']}_{p['away']}"
-                selected.append(p)
+            slot_picks.sort(key=_pick_selection_score, reverse=True)
+            for pick in slot_picks[:slot_count]:
+                match_key = _match_key(pick)
+                selected.append(pick)
                 used_matches.add(match_key)
-                current_odds *= p["odds"]
+                current_odds *= pick["odds"]
 
-        # Phase 2: Fill remaining with "fill" slot picks until target reached
-        fill_slots = [s for s in market_slots if s.get("fill")]
+        fill_slots = [slot for slot in market_slots if slot.get("fill")]
         if fill_slots and current_odds < target:
-            fs = fill_slots[0]
-            fill_market = fs["market"]
-            fill_threshold = fs.get("threshold")
-
+            fill_slot = fill_slots[0]
             fill_picks = [
                 p for p in qualified
-                if p["market"] == fill_market
-                and f"{p['home']}_{p['away']}" not in used_matches
+                if p["market"] == fill_slot["market"]
+                and _match_key(p) not in used_matches
+                and _match_key(p) not in disallowed_match_keys
             ]
-
-            if fill_market == "Over/Under" and fill_threshold is not None:
-                fill_picks = [
-                    p for p in fill_picks
-                    if _pick_threshold(p) == fill_threshold
-                ]
-
-            fill_picks.sort(key=lambda p: p["confidence"], reverse=True)
-
-            for p in fill_picks:
+            if fill_slot["market"] == "Over/Under" and fill_slot.get("threshold") is not None:
+                fill_picks = [p for p in fill_picks if _pick_threshold(p) == fill_slot["threshold"]]
+            fill_picks.sort(key=_pick_selection_score, reverse=True)
+            for pick in fill_picks:
                 if current_odds >= target:
                     break
-                match_key = f"{p['home']}_{p['away']}"
-                if match_key in used_matches:
+                match_key = _match_key(pick)
+                selected.append(pick)
+                used_matches.add(match_key)
+                current_odds *= pick["odds"]
+
+    league_counts: dict[str, int] = {}
+    max_per_league = max(3, len(qualified) // 5) if qualified else 3
+    for pick in qualified:
+        if current_odds >= target:
+            break
+        match_key = _match_key(pick)
+        if match_key in used_matches or match_key in disallowed_match_keys:
+            continue
+        league = pick.get("league", "")
+        if league_counts.get(league, 0) >= max_per_league:
+            continue
+        selected.append(pick)
+        used_matches.add(match_key)
+        current_odds *= pick["odds"]
+        league_counts[league] = league_counts.get(league, 0) + 1
+
+    return selected
+
+
+def _select_unique_ticket_from_pool(
+    qualified: list[dict],
+    reference_picks: list[dict],
+    target: float,
+    forbidden_pick_keys: set[str],
+) -> list[dict]:
+    """Build a unique ticket on the same fixtures using different markets."""
+    forced_match_keys = [_match_key(p) for p in reference_picks]
+    ref_by_match = {_match_key(p): p for p in reference_picks}
+    by_match: dict[str, list[dict]] = {}
+
+    for pick in qualified:
+        match_key = _match_key(pick)
+        if match_key not in ref_by_match or _pick_key(pick) in forbidden_pick_keys:
+            continue
+        by_match.setdefault(match_key, []).append(pick)
+
+    selected: list[dict] = []
+    candidate_lists: dict[str, list[dict]] = {}
+    for match_key in forced_match_keys:
+        ref_pick = ref_by_match[match_key]
+        candidates = sorted(
+            by_match.get(match_key, []),
+            key=lambda p: _pick_selection_score(p) - abs(float(p.get("odds", 1.0)) - float(ref_pick.get("odds", 1.0))) * 15,
+            reverse=True,
+        )
+        if not candidates:
+            return []
+        selected.append(candidates[0])
+        candidate_lists[match_key] = candidates
+
+    current_odds, _ = _ticket_totals(selected)
+    if current_odds >= target:
+        return selected
+
+    while current_odds < target:
+        best_upgrade = None
+        for idx, current_pick in enumerate(selected):
+            match_key = _match_key(current_pick)
+            candidates = candidate_lists.get(match_key, [])
+            current_key = _pick_key(current_pick)
+            try:
+                current_idx = next(i for i, cand in enumerate(candidates) if _pick_key(cand) == current_key)
+            except StopIteration:
+                continue
+            for alt in candidates[current_idx + 1:]:
+                if float(alt.get("odds", 1.0)) <= float(current_pick.get("odds", 1.0)):
                     continue
-                selected.append(p)
-                used_matches.add(match_key)
-                current_odds *= p["odds"]
+                new_total = current_odds / max(float(current_pick.get("odds", 1.0)), 1.0) * float(alt.get("odds", 1.0))
+                score_drop = _pick_selection_score(current_pick) - _pick_selection_score(alt)
+                candidate_rank = (
+                    0 if new_total >= target else 1,
+                    abs(target - new_total),
+                    score_drop,
+                )
+                if best_upgrade is None or candidate_rank < best_upgrade["rank"]:
+                    best_upgrade = {"index": idx, "pick": alt, "new_total": new_total, "rank": candidate_rank}
 
-        # Phase 3: If still under target, add any high-confidence pick
-        if current_odds < target:
-            remaining = [
-                p for p in qualified
-                if f"{p['home']}_{p['away']}" not in used_matches
-            ]
-            remaining.sort(key=lambda p: p["confidence"], reverse=True)
-            for p in remaining:
-                if current_odds >= target:
-                    break
-                match_key = f"{p['home']}_{p['away']}"
-                selected.append(p)
-                used_matches.add(match_key)
-                current_odds *= p["odds"]
-    else:
-        # Default: greedy combo with league diversity check
-        league_counts = {}
-        max_per_league = max(3, len(qualified) // 5)  # At most ~1/5 of picks from same league
+        if best_upgrade is None:
+            break
 
-        for p in qualified:
-            if current_odds >= target:
+        selected[best_upgrade["index"]] = best_upgrade["pick"]
+        current_odds = best_upgrade["new_total"]
+
+    return selected
+
+
+def _generate_dynamic_bundle(
+    all_scored: list[dict],
+    ticket_count: int,
+    target: float,
+    pick_cfg: dict,
+    excluded: set[str],
+    market_slots: list[dict] | None = None,
+    shuffle_seed: int = 0,
+) -> tuple[list[dict], dict | None, bool]:
+    """Build a dynamic multi-ticket bundle with soft fallback."""
+    best_bundle: list[dict] = []
+    best_profile = None
+    profiles = _build_fallback_profiles(pick_cfg)
+
+    for profile in profiles:
+        bundle = []
+        used_match_keys: set[str] = set()
+        qualified = _build_qualified_pool(all_scored, excluded, profile, market_slots, shuffle_seed)
+        for ticket_id in range(1, ticket_count + 1):
+            picks = _select_ticket_from_pool(qualified, target, market_slots, used_match_keys)
+            if not picks:
                 break
-            match_key = f"{p['home']}_{p['away']}"
-            if match_key in used_matches:
+            bundle.append(_make_ticket_entry(ticket_id, "dynamic", target, picks, profile.get("notes", [])))
+            used_match_keys.update({_match_key(p) for p in picks})
+        if len(bundle) > len(best_bundle):
+            best_bundle = bundle
+            best_profile = profile
+        if len(bundle) == ticket_count:
+            return bundle, profile, False
+
+    if not best_bundle or best_profile is None:
+        return best_bundle, best_profile, False
+
+    reuse_bundle = [
+        _make_ticket_entry(
+            ticket["id"],
+            ticket["mode"],
+            ticket["target_odds"],
+            ticket["picks"],
+            ticket["fallback_notes"],
+            reused_fixtures=ticket.get("reused_fixtures", False),
+            excluded_pick_keys=ticket.get("_excluded_pick_keys", set()),
+        )
+        for ticket in best_bundle
+    ]
+    qualified = _build_qualified_pool(all_scored, excluded, best_profile, market_slots, shuffle_seed)
+    for ticket_id in range(len(reuse_bundle) + 1, ticket_count + 1):
+        picks = _select_ticket_from_pool(qualified, target, market_slots, set())
+        if not picks:
+            break
+        notes = list(best_profile.get("notes", [])) + ["Reused fixtures after pool exhaustion"]
+        reuse_bundle.append(_make_ticket_entry(ticket_id, "dynamic", target, picks, notes, reused_fixtures=True))
+
+    if len(reuse_bundle) > len(best_bundle):
+        return reuse_bundle, best_profile, True
+    return best_bundle, best_profile, False
+
+
+def _generate_unique_bundle(
+    all_scored: list[dict],
+    ticket_count: int,
+    target: float,
+    pick_cfg: dict,
+    excluded: set[str],
+    shuffle_seed: int = 0,
+) -> tuple[list[dict], dict | None]:
+    """Build a unique-ticket bundle that keeps the same fixtures across tickets."""
+    best_bundle: list[dict] = []
+    best_profile = None
+    profiles = _build_fallback_profiles(pick_cfg)
+
+    for profile in profiles:
+        qualified = _build_qualified_pool(all_scored, excluded, profile, None, shuffle_seed)
+        base_picks = _select_ticket_from_pool(qualified, target, None, set())
+        if not base_picks:
+            continue
+
+        bundle = [_make_ticket_entry(1, "unique", target, base_picks, profile.get("notes", []))]
+        used_pick_keys = {_pick_key(p) for p in base_picks}
+
+        for ticket_id in range(2, ticket_count + 1):
+            picks = _select_unique_ticket_from_pool(qualified, base_picks, target, used_pick_keys)
+            if not picks:
+                break
+            bundle.append(_make_ticket_entry(ticket_id, "unique", target, picks, profile.get("notes", [])))
+            used_pick_keys.update({_pick_key(p) for p in picks})
+
+        if len(bundle) > len(best_bundle):
+            best_bundle = bundle
+            best_profile = profile
+        if len(bundle) == ticket_count:
+            return bundle, profile
+
+    return best_bundle, best_profile
+
+
+def _generate_pick_bundle(context) -> tuple[list[dict], dict | None, bool]:
+    """Generate a single or multi-ticket bundle from the scored pool."""
+    req = _ensure_pick_request(context)
+    all_scored = context.user_data.get("pick_all_scored", [])
+    excluded = context.user_data.get("pick_excluded", set())
+    shuffle_seed = context.user_data.get("pick_shuffle_seed", 0)
+    chat_id = context.user_data.get("chat_id")
+    config = load_user_config(chat_id=chat_id)
+    pick_cfg = _get_pick_config(config)
+    market_slots = context.user_data.get("pick_market_slots")
+    target = float(req.get("target_odds") or context.user_data.get("pick_target", 10))
+
+    if req.get("ticket_type") != "multiple":
+        qualified = _build_qualified_pool(all_scored, excluded, pick_cfg, market_slots, shuffle_seed)
+        picks = _select_ticket_from_pool(qualified, target, market_slots, set())
+        if not picks:
+            return [], None, False
+        return [_make_ticket_entry(1, "single", target, picks, [])], pick_cfg, False
+
+    ticket_count = int(req.get("ticket_count", 2))
+    ticket_mode = req.get("ticket_mode", "dynamic")
+    if ticket_mode == "unique":
+        bundle, profile = _generate_unique_bundle(all_scored, ticket_count, target, pick_cfg, excluded, shuffle_seed)
+        return bundle, profile, False
+
+    bundle, profile, reused = _generate_dynamic_bundle(all_scored, ticket_count, target, pick_cfg, excluded, None, shuffle_seed)
+    return bundle, profile, reused
+
+
+def _build_ticket_review_text(ticket: dict, heading: str | None = None) -> str:
+    """Format a single ticket for Telegram review."""
+    picks = ticket.get("picks", [])
+    lines = [heading or f"🎫 Ticket {ticket.get('id', 1)}"]
+    lines.append("")
+
+    verdict_icons = {"strong": "🟢", "moderate": "🟡", "weak": "🟠"}
+    for idx, pick in enumerate(picks, 1):
+        icon = verdict_icons.get(pick.get("verdict", ""), "❓")
+        market_label = pick.get("pick", "").replace("(total=", "").replace(")", "")
+        conf = pick.get("data_confidence", pick.get("confidence", "?"))
+        lines.append(f"{icon} {idx}. {pick.get('home')} vs {pick.get('away')}")
+        lines.append(f"   {pick.get('market')}: {market_label} @ ~{pick.get('odds', 0):.2f} [{conf}%]")
+        reasons = pick.get("analysis_reasons", [])
+        if reasons:
+            lines.append(f"   > {reasons[0]}")
+        lines.append("")
+
+    lines.append(f"Total Odds: ~{ticket.get('total_odds', 1.0):.2f}")
+    lines.append(f"Selections: {len(picks)}")
+    lines.append(f"Avg Confidence: {ticket.get('avg_confidence', 0)}%")
+    if ticket.get("fallback_notes"):
+        lines.append(f"Fallback: {'; '.join(ticket['fallback_notes'])}")
+    if ticket.get("reused_fixtures"):
+        lines.append("Reuse note: fixtures were reused after pool exhaustion")
+    return "\n".join(lines)
+
+
+async def _show_pick_bundle_summary(message, context, edit: bool = False):
+    """Show the multi-ticket bundle summary with high-level actions."""
+    bundle = context.user_data.get("pick_bundle", [])
+    req = _ensure_pick_request(context)
+    if not bundle:
+        await _send_or_edit(message, "No tickets available right now.", edit=edit)
+        return ConversationHandler.END
+
+    lines = [
+        f"🎫 Bundle ready: {len(bundle)} ticket(s)",
+        f"Mode: {req.get('ticket_mode', 'dynamic').title()}",
+        f"Target per ticket: ~{float(req.get('target_odds') or 0):.0f} odds",
+        "",
+    ]
+
+    for ticket in bundle:
+        status_bits = [f"~{ticket['total_odds']:.2f} odds", f"{ticket['avg_confidence']}% avg"]
+        if ticket.get("fallback_notes"):
+            status_bits.append("fallback used")
+        if ticket.get("reused_fixtures"):
+            status_bits.append("fixtures reused")
+        lines.append(f"Ticket {ticket['id']}: " + " | ".join(status_bits))
+
+    buttons = [
+        [InlineKeyboardButton(f"✏️ Edit Ticket {ticket['id']}", callback_data=f"pick_bundle_edit_{idx}")]
+        for idx, ticket in enumerate(bundle)
+    ]
+    buttons.append([
+        InlineKeyboardButton("🔄 Reshuffle Bundle", callback_data="pick_bundle_reshuffle"),
+        InlineKeyboardButton("✅ Book All", callback_data="pick_bundle_book"),
+    ])
+
+    await _send_or_edit(
+        message,
+        "\n".join(lines) + "\n\nChoose a ticket to edit or book the whole bundle.",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        edit=edit,
+    )
+    return PICK_REVIEW
+
+
+async def _show_pick_bundle_ticket_detail(message, context, edit: bool = False):
+    """Show the currently active ticket inside a bundle."""
+    bundle = context.user_data.get("pick_bundle", [])
+    idx = context.user_data.get("active_ticket_index", 0)
+    if idx < 0 or idx >= len(bundle):
+        return await _show_pick_bundle_summary(message, context, edit=edit)
+
+    ticket = bundle[idx]
+    combo = ticket.get("picks", [])
+    context.user_data["pick_combo"] = combo
+    context.user_data["pick_excluded"] = set(ticket.get("_excluded_pick_keys", set()))
+
+    buttons = []
+    for pick_idx, _pick in enumerate(combo):
+        buttons.append([
+            InlineKeyboardButton(f"❌ {pick_idx + 1}", callback_data=f"pick_exclude_{pick_idx}"),
+            InlineKeyboardButton(f"🔄 {pick_idx + 1}", callback_data=f"pick_change_{pick_idx}"),
+        ])
+    buttons.append([
+        InlineKeyboardButton("📖 Why these?", callback_data="pick_explain_all"),
+        InlineKeyboardButton("🔀 Reshuffle Ticket", callback_data="pick_reshuffle"),
+    ])
+    buttons.append([
+        InlineKeyboardButton("⬅️ Back to Bundle", callback_data="pick_bundle_back"),
+        InlineKeyboardButton("✅ Book All", callback_data="pick_bundle_book"),
+    ])
+
+    await _send_or_edit(
+        message,
+        _build_ticket_review_text(ticket, heading=f"🎫 Ticket {ticket['id']} of {len(bundle)}"),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        edit=edit,
+    )
+    return PICK_REVIEW
+
+
+def _rebuild_bundle_ticket(context) -> dict | None:
+    """Rebuild the active ticket in a bundle using the stored bundle profile."""
+    bundle = context.user_data.get("pick_bundle", [])
+    idx = context.user_data.get("active_ticket_index", 0)
+    if idx < 0 or idx >= len(bundle):
+        return None
+
+    req = _ensure_pick_request(context)
+    profile = context.user_data.get("pick_bundle_fallback") or _get_pick_config(load_user_config(chat_id=context.user_data.get("chat_id")))
+    all_scored = context.user_data.get("pick_all_scored", [])
+    excluded = set(context.user_data.get("pick_excluded", set()))
+    qualified = _build_qualified_pool(all_scored, excluded, profile, None, context.user_data.get("pick_shuffle_seed", 0))
+    target = float(req.get("target_odds") or context.user_data.get("pick_target", 10))
+    current_ticket = bundle[idx]
+
+    if req.get("ticket_mode") == "unique":
+        reference_picks = bundle[0].get("picks", [])
+        forbidden = set(excluded)
+        for other_idx, ticket in enumerate(bundle):
+            if other_idx == idx:
                 continue
-
-            # Limit concentration from any single league
-            p_league = p.get("league", "")
-            if league_counts.get(p_league, 0) >= max_per_league:
+            forbidden.update({_pick_key(p) for p in ticket.get("picks", [])})
+        picks = _select_unique_ticket_from_pool(qualified, reference_picks, target, forbidden)
+    else:
+        other_match_keys = set()
+        for other_idx, ticket in enumerate(bundle):
+            if other_idx == idx:
                 continue
+            other_match_keys.update({_match_key(p) for p in ticket.get("picks", [])})
+        picks = _select_ticket_from_pool(qualified, target, None, other_match_keys)
+        if not picks and current_ticket.get("reused_fixtures"):
+            picks = _select_ticket_from_pool(qualified, target, None, set())
 
-            selected.append(p)
-            used_matches.add(match_key)
-            current_odds *= p["odds"]
-            league_counts[p_league] = league_counts.get(p_league, 0) + 1
+    if not picks:
+        return None
 
+    rebuilt = _make_ticket_entry(
+        current_ticket["id"],
+        current_ticket.get("mode", req.get("ticket_mode", "dynamic")),
+        target,
+        picks,
+        current_ticket.get("fallback_notes", []),
+        reused_fixtures=current_ticket.get("reused_fixtures", False),
+        excluded_pick_keys=excluded,
+    )
+    bundle[idx] = rebuilt
+    context.user_data["pick_bundle"] = bundle
+    context.user_data["pick_combo"] = rebuilt["picks"]
+    return rebuilt
+
+
+def _sync_active_bundle_ticket_from_combo(context) -> dict | None:
+    """Persist the current pick_combo back into the active bundle ticket."""
+    bundle = context.user_data.get("pick_bundle", [])
+    idx = context.user_data.get("active_ticket_index", 0)
+    if idx < 0 or idx >= len(bundle):
+        return None
+
+    current = bundle[idx]
+    picks = [dict(p) for p in context.user_data.get("pick_combo", [])]
+    rebuilt = _make_ticket_entry(
+        current["id"],
+        current.get("mode", "dynamic"),
+        current.get("target_odds", context.user_data.get("pick_target", 10)),
+        picks,
+        current.get("fallback_notes", []),
+        reused_fixtures=current.get("reused_fixtures", False),
+        excluded_pick_keys=set(context.user_data.get("pick_excluded", set())),
+    )
+    bundle[idx] = rebuilt
+    context.user_data["pick_bundle"] = bundle
+    return rebuilt
+
+
+async def _show_single_ticket_combo(message, context, ticket: dict, edit: bool = False):
+    """Render the standard single-ticket review UI."""
+    selected = ticket.get("picks", [])
+    target = ticket.get("target_odds", context.user_data.get("pick_target", 10))
     if not selected:
-        await message.reply_text(
+        await _send_or_edit(
+            message,
             "Couldn't find enough strong picks for that target right now.\n"
-            "Try widening the window with /timeframe or adding more leagues with /leagues."
+            "Try widening the window with /timeframe or adding more leagues with /leagues.",
+            edit=edit,
         )
         return ConversationHandler.END
 
-    # Store combo
-    context.user_data["pick_combo"] = selected
-
-    # Format header with active leagues + timeframe
-    from config import LEAGUE_NAMES as _LN, TIMEFRAME_PRESETS as _TP
+    chat_id = context.user_data.get("chat_id")
     config = load_user_config(chat_id=chat_id)
-    _leagues = config.get("leagues", [])
-    _tf = config.get("timeframe", "7days")
-    _league_str = ", ".join(_LN.get(lid, str(lid)) for lid in _leagues) if _leagues else "All"
-    _tf_str = _TP.get(_tf, {}).get("label", _tf)
+    from config import LEAGUE_NAMES as _LN, TIMEFRAME_PRESETS as _TP
+
+    leagues = config.get("leagues", [])
+    timeframe = config.get("timeframe", "7days")
+    league_str = ", ".join(_LN.get(lid, str(lid)) for lid in leagues) if leagues else "All"
+    timeframe_str = _TP.get(timeframe, {}).get("label", timeframe)
 
     verdict_icons = {"strong": "🟢", "moderate": "🟡", "weak": "🟠"}
-    lines = [f"🎯 Picks for ~{target:.0f} odds | {_league_str} | {_tf_str}\n"]
+    lines = [f"🎯 Picks for ~{target:.0f} odds | {league_str} | {timeframe_str}", ""]
 
-    # Sort selected by kickoff date for grouped display
-    from datetime import datetime as _dt
-
-    def _parse_date(d):
-        try:
-            return _dt.strptime(d, "%Y-%m-%d %H:%M")
-        except Exception:
-            return _dt.max
-
-    selected.sort(key=lambda p: _parse_date(p.get("date", "")))
-
-    # Group by date and show headers
-    current_day = None
-    for i, p in enumerate(selected, 1):
-        pick_date = p.get("date", "")
-        try:
-            dt = _dt.strptime(pick_date, "%Y-%m-%d %H:%M")
-            day_str = dt.strftime("%a %d %b")
-            time_str = dt.strftime("%H:%M")
-        except Exception:
-            day_str = ""
-            time_str = pick_date
-
-        # Insert day header when date changes
-        if day_str and day_str != current_day:
-            current_day = day_str
-            lines.append(f"── {day_str} ──")
-
-        icon = verdict_icons.get(p.get("verdict", ""), "❓")
-        market_label = p["pick"].replace("(total=", "").replace(")", "") if "total=" in p["pick"] else p["pick"]
-        conf = p.get('data_confidence', p['confidence'])
-        # Margin: ±5 for good data, ±10 for limited, ±15 for odds-only
-        dq = p.get("data_quality", "good")
-        margin = 5 if dq == "good" else 10 if dq == "fair" else 15
-        conf_low = max(0, conf - margin)
-        conf_high = min(95, conf + margin)
-        lines.append(
-            f"{icon} {i}. {p['home']} vs {p['away']}\n"
-            f"   [{p['league']}] {time_str}\n"
-            f"   {p['market']}: {market_label} @ ~{p['odds']:.2f} [{conf_low}-{conf_high}%]"
-        )
-        for r in p.get("analysis_reasons", [])[:1]:
-            lines.append(f"   > {r}")
-        if p.get("suggestion"):
-            lines.append(f"   💡 Swap to: {p['suggestion']['market']} ({p['suggestion']['confidence']}%)")
+    for idx, pick in enumerate(selected, 1):
+        icon = verdict_icons.get(pick.get("verdict", ""), "❓")
+        market_label = pick.get("pick", "").replace("(total=", "").replace(")", "")
+        conf = pick.get("data_confidence", pick.get("confidence", 0))
+        lines.append(f"{icon} {idx}. {pick.get('home')} vs {pick.get('away')}")
+        lines.append(f"   [{pick.get('league', '')}] {pick.get('market')}: {market_label} @ ~{pick.get('odds', 0):.2f} [{conf}%]")
+        reasons = pick.get("analysis_reasons", [])
+        if reasons:
+            lines.append(f"   > {reasons[0]}")
         lines.append("")
 
-    avg_conf = int(sum(p.get("data_confidence", p["confidence"]) for p in selected) / len(selected))
-    lines.append(f"Total Odds: ~{current_odds:.2f}")
+    lines.append(f"Total Odds: ~{ticket.get('total_odds', 1.0):.2f}")
     lines.append(f"Selections: {len(selected)}")
-    lines.append(f"Avg Confidence: {avg_conf}%")
+    lines.append(f"Avg Confidence: {ticket.get('avg_confidence', 0)}%")
 
-    # Show kickoff spread
-    dates = [_parse_date(p.get("date", "")) for p in selected if _parse_date(p.get("date", "")) != _dt.max]
-    if len(dates) >= 2:
-        span = (max(dates) - min(dates)).days
-        if span == 0:
-            lines.append(f"All games kick off the same day")
-        else:
-            lines.append(f"Spread across {span + 1} days ({min(dates).strftime('%d %b')} → {max(dates).strftime('%d %b')})")
-
-    if current_odds < target * 0.7:
-        lines.append(f"\n⚠️ Under target ({current_odds:.1f} vs {target:.0f})")
-
-    # Odds freshness timestamp
-    lines.append(f"\nOdds fetched: {_dt.now().strftime('%H:%M %d %b')} — book soon, odds move")
-
-    msg = "\n".join(lines)
-
-    # Exclude + change market + reshuffle + confirm + explain buttons
     buttons = []
-    for i, p in enumerate(selected):
-        row = [
-            InlineKeyboardButton(f"❌ {i+1}", callback_data=f"pick_exclude_{i}"),
-            InlineKeyboardButton(f"🔄 {i+1}", callback_data=f"pick_change_{i}"),
-        ]
-        buttons.append(row)
-
+    for idx, _pick in enumerate(selected):
+        buttons.append([
+            InlineKeyboardButton(f"❌ {idx + 1}", callback_data=f"pick_exclude_{idx}"),
+            InlineKeyboardButton(f"🔄 {idx + 1}", callback_data=f"pick_change_{idx}"),
+        ])
     buttons.append([
         InlineKeyboardButton("📖 Why these?", callback_data="pick_explain_all"),
         InlineKeyboardButton("🔄 Reshuffle", callback_data="pick_reshuffle"),
@@ -1428,24 +2195,164 @@ async def _pick_build_combo(message, context):
         InlineKeyboardButton("✅ Lock it in", callback_data="pick_confirm"),
     ])
 
-    msg += "\n\nEdit, explain, reshuffle, or lock it in:"
-    await message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons))
-
+    await _send_or_edit(
+        message,
+        "\n".join(lines) + "\n\nEdit, explain, reshuffle, or lock it in:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        edit=edit,
+    )
     return PICK_REVIEW
 
 
+async def _pick_build_combo(message, context):
+    """Build and render either a single ticket or a multi-ticket bundle."""
+    if context.user_data.get("_check_mode"):
+        chat_id = context.user_data.get("chat_id")
+        config = load_user_config(chat_id=chat_id)
+        pick_cfg = _get_pick_config(config)
+        qualified = _build_qualified_pool(
+            context.user_data.get("pick_all_scored", []),
+            context.user_data.get("pick_excluded", set()),
+            pick_cfg,
+            None,
+            context.user_data.get("pick_shuffle_seed", 0),
+        )
+        picks = _select_ticket_from_pool(
+            qualified,
+            float(context.user_data.get("pick_target", 10)),
+            None,
+            set(),
+        )
+        if not picks:
+            await _send_or_edit(message, "Couldn't build a combo from these picks.", edit=False)
+            return ConversationHandler.END
+        ticket = _make_ticket_entry(1, "single", float(context.user_data.get("pick_target", 10)), picks, [])
+        context.user_data["pick_combo"] = ticket["picks"]
+        return await _show_single_ticket_combo(message, context, ticket, edit=False)
+
+    req = _ensure_pick_request(context)
+    if req.get("ticket_type") == "multiple":
+        if context.user_data.get("pick_bundle_review_mode") == "ticket" and context.user_data.get("pick_bundle"):
+            rebuilt = _rebuild_bundle_ticket(context)
+            if rebuilt is None:
+                await _send_or_edit(
+                    message,
+                    "Couldn't rebuild that ticket with the current constraints. Try reshuffling the bundle instead.",
+                    edit=False,
+                )
+                return PICK_REVIEW
+            return await _show_pick_bundle_ticket_detail(message, context, edit=False)
+
+        bundle, profile, reused = _generate_pick_bundle(context)
+        if not bundle:
+            await _send_or_edit(
+                message,
+                "Couldn't find enough valid tickets for that bundle right now.\n"
+                "Try fewer tickets, lower target odds, or a wider timeframe.",
+                edit=False,
+            )
+            return ConversationHandler.END
+
+        context.user_data["pick_bundle"] = bundle
+        context.user_data["pick_bundle_fallback"] = profile
+        context.user_data["pick_bundle_review_mode"] = "bundle"
+        context.user_data["pick_bundle_mode"] = req.get("ticket_mode", "dynamic")
+        context.user_data["pick_combo"] = bundle[0]["picks"]
+        if reused:
+            context.user_data["pick_bundle_allow_reuse"] = True
+        return await _show_pick_bundle_summary(message, context, edit=False)
+
+    bundle, profile, _ = _generate_pick_bundle(context)
+    if not bundle:
+        await _send_or_edit(
+            message,
+            "Couldn't find enough strong picks for that target right now.\n"
+            "Try widening the window with /timeframe or adding more leagues with /leagues.",
+            edit=False,
+        )
+        return ConversationHandler.END
+
+    ticket = bundle[0]
+    context.user_data["pick_bundle"] = bundle
+    context.user_data["pick_bundle_fallback"] = profile
+    context.user_data["pick_bundle_review_mode"] = "single"
+    context.user_data["pick_combo"] = ticket["picks"]
+    return await _show_single_ticket_combo(message, context, ticket, edit=False)
+
+
 async def _pick_confirm_and_book(message, context):
-    """Shared booking logic — called from button confirm or NL 'book it'."""
+    """Shared booking logic for a single ticket or full bundle."""
+    bundle = context.user_data.get("pick_bundle", [])
+    if bundle and not context.user_data.get("_check_mode"):
+        await message.reply_text(f"📲 Generating SportyBet booking codes for {len(bundle)} ticket(s)...")
+        result_lines = ["🎫 *Bundle Booking Codes*\n"]
+        any_success = False
+        for ticket in bundle:
+            booking_result = await _book_ticket_picks(ticket.get("picks", []))
+            result_lines.append(f"*Ticket {ticket['id']}* — ~{ticket['total_odds']:.2f} odds")
+            if booking_result["code"]:
+                any_success = True
+                result_lines.append(f"Code: `{booking_result['code']}`")
+                result_lines.append(f"Selections: {booking_result['selection_count']}")
+            else:
+                result_lines.append("Code: booking failed")
+            if booking_result["failed"]:
+                result_lines.append("Issues:")
+                for item in booking_result["failed"]:
+                    result_lines.append(f"- {item}")
+            result_lines.append("")
+
+        await send_long_message(message, "\n".join(result_lines))
+        if any_success:
+            await message.reply_text(
+                "Load each code separately in SportyBet:\n"
+                "Betslip → Load Booking Code → Paste"
+            )
+        _clear_pick_runtime(context)
+        return ConversationHandler.END
+
     combo = context.user_data.get("pick_combo", [])
+    if not combo and bundle:
+        combo = bundle[0].get("picks", [])
     if not combo:
         await message.reply_text("No picks to book. Use /pick to start.")
         return ConversationHandler.END
 
     await message.reply_text("📲 Generating your SportyBet booking code...")
+    booking_result = await _book_ticket_picks(combo)
+    total_odds, _avg_conf = _ticket_totals(combo)
 
-    total_odds = 1.0
-    for p in combo:
-        total_odds *= p["odds"]
+    if booking_result["code"]:
+        await message.reply_text(
+            f"🎫 *SportyBet Booking Code:* `{booking_result['code']}`\n\n"
+            f"Tap the code to copy, then:\n"
+            f"SportyBet App → Betslip → Load Booking Code → Paste\n\n"
+            f"Selections: {booking_result['selection_count']} | Total Odds: ~{total_odds:.2f}",
+            parse_mode="Markdown",
+        )
+    else:
+        await message.reply_text(
+            "⚠️ Booking code generation failed.\n"
+            "SportyBet API might be temporarily unavailable.\n"
+            "You can manually select the games above."
+        )
+    if booking_result["failed"] and booking_result["selection_count"]:
+        await message.reply_text(
+            "⚠️ Some picks couldn't be booked:\n" + "\n".join(booking_result["failed"])
+        )
+    elif booking_result["failed"]:
+        await message.reply_text(
+            "⚠️ Could not book — no valid selections.\n" + "\n".join(booking_result["failed"])
+        )
+
+    _clear_pick_runtime(context)
+    return ConversationHandler.END
+
+
+async def _book_ticket_picks(combo: list[dict]) -> dict:
+    """Build and submit one booking ticket to SportyBet."""
+    if not combo:
+        return {"code": None, "failed": ["No picks in ticket"], "selection_count": 0}
 
     booking_selections = []
     failed_bookings = []
@@ -1475,37 +2382,14 @@ async def _pick_confirm_and_book(message, context):
         else:
             failed_bookings.append(f"{p['home']} vs {p['away']}: could not build selection")
 
+    code = None
     if booking_selections:
         code = await asyncio.to_thread(create_booking_code, booking_selections)
-        if code:
-            await message.reply_text(
-                f"🎫 *SportyBet Booking Code:* `{code}`\n\n"
-                f"Tap the code to copy, then:\n"
-                f"SportyBet App → Betslip → Load Booking Code → Paste\n\n"
-                f"Selections: {len(booking_selections)} | Total Odds: ~{total_odds:.2f}",
-                parse_mode="Markdown",
-            )
-        else:
-            await message.reply_text(
-                "⚠️ Booking code generation failed.\n"
-                "SportyBet API might be temporarily unavailable.\n"
-                "You can manually select the games above."
-            )
-    else:
-        await message.reply_text(
-            "⚠️ Could not book — no valid selections.\n"
-            + ("\n".join(failed_bookings) if failed_bookings else "")
-        )
-
-    if failed_bookings and booking_selections:
-        await message.reply_text(
-            "⚠️ Some picks couldn't be booked:\n" + "\n".join(failed_bookings)
-        )
-
-    # Clean up
-    for key in ["pick_all_scored", "pick_combo", "pick_target", "pick_excluded", "pick_shuffle_seed", "_pick_msg", "pick_market_slots"]:
-        context.user_data.pop(key, None)
-    return ConversationHandler.END
+    return {
+        "code": code,
+        "failed": failed_bookings,
+        "selection_count": len(booking_selections),
+    }
 
 
 async def pick_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1513,6 +2397,35 @@ async def pick_review_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     data = query.data
+    bundle_mode = context.user_data.get("pick_bundle_review_mode")
+
+    if data == "pick_bundle_book":
+        return await _pick_confirm_and_book(query.message, context)
+
+    if data == "pick_bundle_reshuffle":
+        seed = context.user_data.get("pick_shuffle_seed", 0) + 1
+        context.user_data["pick_shuffle_seed"] = seed
+        context.user_data["pick_bundle_review_mode"] = "bundle"
+        await query.edit_message_text(f"🔄 Rebuilding bundle (seed {seed})...")
+        return await _pick_build_combo(query.message, context)
+
+    if data == "pick_bundle_back":
+        _sync_active_bundle_ticket_from_combo(context)
+        context.user_data["pick_bundle_review_mode"] = "bundle"
+        return await _show_pick_bundle_summary(query.message, context, edit=True)
+
+    if data.startswith("pick_bundle_edit_"):
+        idx = int(data.replace("pick_bundle_edit_", ""))
+        bundle = context.user_data.get("pick_bundle", [])
+        if 0 <= idx < len(bundle):
+            context.user_data["active_ticket_index"] = idx
+            context.user_data["pick_bundle_review_mode"] = "ticket"
+            context.user_data["pick_combo"] = [dict(p) for p in bundle[idx].get("picks", [])]
+            context.user_data["pick_excluded"] = set(bundle[idx].get("_excluded_pick_keys", set()))
+            context.user_data.pop("pick_change_idx", None)
+            context.user_data.pop("pick_change_alts", None)
+            return await _show_pick_bundle_ticket_detail(query.message, context, edit=True)
+        return PICK_REVIEW
 
     if data == "pick_explain_all":
         combo = context.user_data.get("pick_combo", [])
@@ -1570,6 +2483,9 @@ async def pick_review_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             else:
                 await query.edit_message_text("No suggestion available for this pick.\nRebuilding...")
+        if bundle_mode == "ticket":
+            _sync_active_bundle_ticket_from_combo(context)
+            return await _show_pick_bundle_ticket_detail(query.message, context, edit=True)
         return await _pick_build_combo(query.message, context)
 
     elif data.startswith("pick_change_"):
@@ -1695,6 +2611,9 @@ async def pick_review_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             await query.edit_message_text("Rebuilding...")
 
+        if bundle_mode == "ticket":
+            _sync_active_bundle_ticket_from_combo(context)
+            return await _show_pick_bundle_ticket_detail(query.message, context, edit=True)
         return await _pick_build_combo(query.message, context)
 
     elif data.startswith("pick_exclude_"):
@@ -1837,6 +2756,7 @@ async def _apply_combo_edits(message, context, combo, actions):
     all_scored = context.user_data.get("pick_all_scored", context.user_data.get("check_all_scored", []))
     excluded = context.user_data.get("pick_excluded", context.user_data.get("check_excluded", set()))
     changes_made = []
+    needs_rebuild = False
 
     for action in actions:
         idx = action.get("index", 0) - 1  # User uses 1-based
@@ -1846,6 +2766,7 @@ async def _apply_combo_edits(message, context, combo, actions):
         if action["type"] == "remove":
             excluded.add(_pick_key(combo[idx]))
             changes_made.append(f"❌ Dropped #{idx+1}: {combo[idx]['home']} vs {combo[idx]['away']}")
+            needs_rebuild = True
 
         elif action["type"] == "change":
             target_market = action.get("market", "")
@@ -1903,6 +2824,10 @@ async def _apply_combo_edits(message, context, combo, actions):
 
     if changes_made:
         await message.reply_text("\n".join(changes_made) + "\n\nRebuilding...")
+
+    if context.user_data.get("pick_bundle_review_mode") == "ticket" and not needs_rebuild:
+        _sync_active_bundle_ticket_from_combo(context)
+        return await _show_pick_bundle_ticket_detail(message, context, edit=False)
 
     # Route back to appropriate build function
     if context.user_data.get("_check_mode"):
@@ -1996,8 +2921,7 @@ def _regex_parse_combo_edit(text: str) -> list[dict]:
 
 async def pick_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the pick flow."""
-    for key in ["pick_all_scored", "pick_combo", "pick_target", "pick_excluded", "pick_shuffle_seed", "_pick_msg"]:
-        context.user_data.pop(key, None)
+    _clear_pick_runtime(context)
     await update.message.reply_text("Pick cancelled.")
     return ConversationHandler.END
 
@@ -2060,6 +2984,8 @@ async def cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current configuration and data freshness."""
+    from config import TIMEFRAME_PRESETS
+
     config = load_user_config(chat_id=update.effective_chat.id)
     budget = await asyncio.to_thread(get_api_budget)
     league_names = [LEAGUE_NAMES.get(lid, str(lid)) for lid in config.get("leagues", [])]
@@ -2068,6 +2994,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     enabled = config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
     min_conf = config.get("min_confidence", pick_cfg.get("min_confidence", 75))
     min_odds = config.get("min_odds", pick_cfg.get("min_odds", 1.05))
+    timeframe = config.get("timeframe", "7days")
+    timeframe_label = TIMEFRAME_PRESETS.get(timeframe, TIMEFRAME_PRESETS["7days"]).get("label", "7 days")
 
     msg = (
         f"SportyBot Status\n\n"
@@ -2075,7 +3003,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Confidence: ≥{min_conf}%\n"
         f"Min Odds: ≥{min_odds}\n"
         f"Markets: {', '.join(enabled)}\n"
-        f"Timeframe: {config.get('days_ahead', 7)} days\n"
+        f"Timeframe: {timeframe_label}\n"
         f"API Budget: {budget['remaining']}/{budget['limit']} remaining\n"
         f"Date: {budget['date']}"
     )
@@ -3225,7 +4153,8 @@ async def handle_natural_language(update: Update, context: ContextTypes.DEFAULT_
         return
 
     # Build context for Gemini
-    config = load_user_config()
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    config = load_user_config(chat_id=chat_id)
     league_names = [LEAGUE_NAMES.get(lid, str(lid)) for lid in config.get("leagues", [])]
     chat_context = {
         "active_leagues": league_names,
@@ -3250,19 +4179,36 @@ async def handle_natural_language(update: Update, context: ContextTypes.DEFAULT_
         # Trigger the pick flow with extracted target odds
         target = params.get("target_odds")
         market_slots = params.get("market_slots")
+        ticket_type = params.get("ticket_type")
+        ticket_count = params.get("ticket_count")
+        ticket_mode = params.get("ticket_mode")
+
+        req = _ensure_pick_request(context)
+        if ticket_type in ("single", "multiple"):
+            req["ticket_type"] = ticket_type
+        elif ticket_count or ticket_mode:
+            req["ticket_type"] = "multiple"
+
+        if ticket_count:
+            try:
+                req["ticket_count"] = max(2, min(5, int(ticket_count)))
+            except (TypeError, ValueError):
+                pass
+        if ticket_mode in ("unique", "dynamic"):
+            req["ticket_mode"] = ticket_mode
+        if target and isinstance(target, (int, float)) and target > 1:
+            req["target_odds"] = float(target)
+            context.user_data["pick_target"] = float(target)
+        context.user_data["pick_request"] = req
 
         if market_slots:
             context.user_data["pick_market_slots"] = market_slots
             logger.info(f"Market slots: {market_slots}")
+        elif req.get("ticket_type") == "multiple":
+            context.user_data.pop("pick_market_slots", None)
 
-        if target and isinstance(target, (int, float)) and target > 1:
-            context.user_data["pick_target"] = float(target)
-            await update.message.reply_text(reply)
-            return await _pick_analyze(update, context, float(target))
-        else:
-            # No target extracted — show the pick menu
-            await update.message.reply_text(reply)
-            return await pick_start(update, context)
+        await update.message.reply_text(reply)
+        return await _continue_pick_request_flow(update.message, context)
 
     elif intent == "check":
         code = params.get("code")
@@ -3386,12 +4332,24 @@ def main():
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_natural_language),
         ],
         states={
+            PICK_TYPE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pick_receive_type_text),
+                CallbackQueryHandler(pick_receive_type_button, pattern=r"^pick_type_"),
+            ],
+            PICK_COUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pick_receive_count_text),
+                CallbackQueryHandler(pick_receive_count_button, pattern=r"^pick_count_"),
+            ],
             PICK_ODDS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, pick_receive_odds_text),
                 CallbackQueryHandler(pick_receive_odds_button, pattern=r"^pick_target_"),
             ],
+            PICK_MODE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pick_receive_mode_text),
+                CallbackQueryHandler(pick_receive_mode_button, pattern=r"^pick_mode_"),
+            ],
             PICK_REVIEW: [
-                CallbackQueryHandler(pick_review_callback, pattern=r"^(pick_exclude_\d+|pick_swap_\d+|pick_change_\d+|pick_mkt_.+|pick_reshuffle|pick_confirm|pick_explain_all)$"),
+                CallbackQueryHandler(pick_review_callback, pattern=r"^(pick_exclude_\d+|pick_swap_\d+|pick_change_\d+|pick_mkt_.+|pick_reshuffle|pick_confirm|pick_explain_all|pick_bundle_.+)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, pick_edit_text),
             ],
         },

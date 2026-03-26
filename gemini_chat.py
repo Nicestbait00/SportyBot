@@ -38,6 +38,9 @@ Return a JSON object (no markdown fences, no extra text) with these fields:
 Intent definitions:
 - "pick": The user wants betting picks or a combo. Extract from their message:
   params.target_odds (float or null) — e.g. "give me 10 odds" → 10.0
+  params.ticket_type ("single"|"multiple"|null) — set when the user clearly asks for one ticket or several
+  params.ticket_count (int or null) — set when the user explicitly asks for multiple tickets, e.g. "3 tickets"
+  params.ticket_mode ("unique"|"dynamic"|null) — "unique" for same games/different markets, "dynamic" for different games
   params.market (string or null) — e.g. "over 2.5 picks" → "over_2.5", "home wins" → "1x2"
   params.market_slots (list or null) — when the user specifies a DISTRIBUTION of markets, extract it as a list of slot objects:
     Each slot: {"market": "1X2"|"Over/Under"|"GG/NG", "count": int, "threshold": float|null, "fill": bool}
@@ -64,6 +67,7 @@ Intent definitions:
 Rules:
 - If the user says "hi", "hello", "hey" etc. → intent "chat", warm greeting reply. Be personable.
 - If the user says something like "get me picks", "find me a bet", "5 odds", "what's good today", "anything hitting?" → intent "pick".
+- If the user says "2 tickets", "3 unique tickets", "multiple tickets", "dynamic tickets" etc. → intent "pick" and populate the ticket fields.
 - If the user mentions a booking code (alphanumeric ~6-10 chars) → intent "check".
 - If the user asks "how is Arsenal doing", "Chelsea form" → intent "stats".
 - If ambiguous, default to "chat" with a helpful reply asking what they need.
@@ -380,6 +384,25 @@ def _fallback_parse(message: str) -> dict:
         target = float(odds_match.group(1)) if odds_match else None
         market = None
         market_slots = None
+        ticket_type = None
+        ticket_count = None
+        ticket_mode = None
+
+        ticket_count_match = re.search(r"\b([2-5])\s*tickets?\b", msg)
+        if ticket_count_match:
+            ticket_type = "multiple"
+            ticket_count = int(ticket_count_match.group(1))
+        elif "multiple ticket" in msg or "multiple bet" in msg:
+            ticket_type = "multiple"
+        elif "single ticket" in msg:
+            ticket_type = "single"
+
+        if "unique ticket" in msg or "unique bets" in msg:
+            ticket_type = "multiple"
+            ticket_mode = "unique"
+        elif "dynamic ticket" in msg or "different games" in msg:
+            ticket_type = "multiple"
+            ticket_mode = "dynamic"
 
         # Try to extract market distribution from structured requests
         slots = _parse_market_slots(msg)
@@ -392,7 +415,14 @@ def _fallback_parse(message: str) -> dict:
 
         return {
             "intent": "pick",
-            "params": {"target_odds": target, "market": market, "market_slots": market_slots},
+            "params": {
+                "target_odds": target,
+                "ticket_type": ticket_type,
+                "ticket_count": ticket_count,
+                "ticket_mode": ticket_mode,
+                "market": market,
+                "market_slots": market_slots,
+            },
             "reply": f"Looking for picks{' at ' + str(target) + ' odds' if target else ''}...",
         }
 

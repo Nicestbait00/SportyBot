@@ -26,9 +26,12 @@ FOOTBALL_DATA_BASE: str = "https://api.football-data.org/v4"
 # Mapping: our league IDs (API-Football) → football-data.org competition codes
 LEAGUE_TO_FD_CODE: dict[int, str] = {
     39: "PL",      # Premier League
+    40: "ELC",     # Championship
     140: "PD",     # La Liga
     135: "SA",     # Serie A
+    94: "PPL",     # Primeira Liga
     78: "BL1",     # Bundesliga
+    88: "DED",     # Eredivisie
     61: "FL1",     # Ligue 1
     2: "CL",       # Champions League
 }
@@ -45,10 +48,18 @@ CACHE_TTL_SECONDS: int = 6 * 60 * 60  # 6 hours
 # ── Common league IDs (API-Football v3) ──────────────────────────────────────
 LEAGUES: dict[str, int] = {
     "premier_league": 39,
+    "championship": 40,
     "la_liga": 140,
     "serie_a": 135,
+    "primeira_liga": 94,
+    "portugal_primera": 94,
     "bundesliga": 78,
+    "eredivisie": 88,
     "ligue_1": 61,
+    "saudi_pro_league": 307,
+    "saudi_league": 307,
+    "a_league": 188,
+    "australian_top_league": 188,
     "champions_league": 2,
     "europa_league": 3,
     "nations_league": 5,
@@ -62,6 +73,43 @@ LEAGUES: dict[str, int] = {
     "international_friendlies": 10,
     "epl": 39,  # alias
     "ucl": 2,   # alias
+}
+
+LEAGUE_DISPLAY_NAMES: dict[int, str] = {
+    39: "Premier League",
+    40: "Championship",
+    140: "La Liga",
+    135: "Serie A",
+    94: "Primeira Liga",
+    78: "Bundesliga",
+    88: "Eredivisie",
+    61: "Ligue 1",
+    307: "Saudi Pro League",
+    188: "A-League",
+    2: "Champions League",
+    3: "Europa League",
+    5: "Nations League",
+    6: "AFCON",
+    36: "AFCON Qualifiers",
+    1: "World Cup",
+    29: "World Cup Qualifiers Africa",
+    32: "World Cup Qualifiers Europe",
+    30: "World Cup Qualifiers Asia",
+    31: "World Cup Qualifiers South America",
+    10: "International Friendlies",
+}
+
+LEAGUE_CATEGORIES: dict[str, dict] = {
+    "A": {
+        "label": "Category A",
+        "description": "Top 5 leagues",
+        "league_ids": [39, 140, 135, 78, 61],
+    },
+    "B": {
+        "label": "Category B",
+        "description": "Championship, Primeira Liga, Saudi Pro League, Eredivisie, A-League",
+        "league_ids": [40, 94, 307, 88, 188],
+    },
 }
 
 # ── Available markets (SportyBet market IDs) ─────────────────────────────────
@@ -186,7 +234,13 @@ AVAILABLE_MARKETS: dict[str, dict] = {
 }
 
 # Default enabled markets for new users
-DEFAULT_ENABLED_MARKETS = ["1X2", "Over/Under", "GG/NG"]
+DEFAULT_ENABLED_MARKETS = [
+    "1X2",
+    "Over/Under",
+    "GG/NG",
+    "Home Over/Under",
+    "Away Over/Under",
+]
 
 # Legacy strategy presets — kept for backward compatibility with saved configs
 # New system uses direct config values instead
@@ -248,10 +302,15 @@ STRATEGY_PRESETS: dict[str, dict] = {
 # Use exact names from SportyBet API, not substrings, to avoid false matches
 LEAGUE_SPORTYBET_NAMES: dict[int, list[str]] = {
     39: ["premier league"],
+    40: ["efl championship", "championship"],
     140: ["laliga"],
     135: ["serie a"],
+    94: ["primeira liga", "liga portugal"],
     78: ["bundesliga"],
+    88: ["eredivisie"],
     61: ["ligue 1"],
+    307: ["saudi professional league", "saudi pro league"],
+    188: ["australia a-league", "a-league"],
     2: ["uefa champions league"],
     3: ["uefa europa league"],
     5: ["uefa nations league"],
@@ -281,14 +340,14 @@ USER_CONFIG_PATH: Path = Path(__file__).resolve().parent / "user_config.json"
 USER_CONFIG_DIR: Path = Path(__file__).resolve().parent / ".config"
 
 # Friendly league names for Telegram display
-LEAGUE_NAMES: dict[int, str] = {v: k.replace("_", " ").title() for k, v in LEAGUES.items() if k not in ("epl", "ucl")}
+LEAGUE_NAMES: dict[int, str] = dict(LEAGUE_DISPLAY_NAMES)
 
 DEFAULT_USER_CONFIG = {
     "leagues": [39, 140, 135, 78, 61],  # Top 5 European leagues
     "strategy": "balanced",  # Legacy — kept for migration
     "min_confidence": 75,    # New config: 0-100
     "min_odds": 1.05,        # New config: minimum odds per pick
-    "enabled_markets": ["1X2", "Over/Under", "GG/NG"],  # New config: toggled markets
+    "enabled_markets": list(DEFAULT_ENABLED_MARKETS),  # New config: toggled markets
     "days_ahead": 14,
     "timeframe": "7days",  # Default timeframe preset
     "telegram_chat_ids": [],
@@ -316,6 +375,7 @@ def load_user_config(chat_id=None) -> dict:
         for k, v in DEFAULT_USER_CONFIG.items():
             if k not in data:
                 data[k] = v
+        _migrate_user_config(data)
         return data
     except (FileNotFoundError, json.JSONDecodeError):
         # If per-user file missing, try global fallback
@@ -325,10 +385,20 @@ def load_user_config(chat_id=None) -> dict:
                 for k, v in DEFAULT_USER_CONFIG.items():
                     if k not in data:
                         data[k] = v
+                _migrate_user_config(data)
                 return data
             except (FileNotFoundError, json.JSONDecodeError):
                 pass
         return dict(DEFAULT_USER_CONFIG)
+
+
+def _migrate_user_config(config: dict) -> None:
+    """Apply lightweight migrations for older saved configs."""
+    if config.get("enabled_markets") == ["1X2", "Over/Under", "GG/NG"]:
+        config["enabled_markets"] = list(DEFAULT_ENABLED_MARKETS)
+
+    leagues = config.get("leagues", DEFAULT_USER_CONFIG["leagues"])
+    config["leagues"] = list(dict.fromkeys(leagues))
 
 
 def save_user_config(config: dict, chat_id=None) -> None:
