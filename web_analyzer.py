@@ -44,6 +44,8 @@ _fd_team_map_loaded = False
 _fd_last_call_time = 0.0
 _FD_MIN_INTERVAL = 4.0  # seconds between calls (safe for 10/min limit, was 6.5)
 _fd_rate_limit_lock = threading.Lock()
+_fd_cooldown_until = 0.0
+_FD_COOLDOWN_SECONDS = 90
 
 
 # ── Cache helpers ────────────────────────────────────────────────────────────
@@ -83,19 +85,40 @@ def _fd_rate_limit():
         _fd_last_call_time = time.time()
 
 
+def _fd_is_cooling_down() -> bool:
+    """Return True if football-data.org is in temporary cooldown after a 429."""
+    with _fd_rate_limit_lock:
+        return time.time() < _fd_cooldown_until
+
+
+def _fd_start_cooldown() -> None:
+    """Pause football-data.org usage briefly after rate limiting."""
+    global _fd_cooldown_until
+    with _fd_rate_limit_lock:
+        _fd_cooldown_until = max(_fd_cooldown_until, time.time() + _FD_COOLDOWN_SECONDS)
+
+
 def _fd_get(endpoint: str, params: dict = None) -> dict:
     """Make a rate-limited GET to football-data.org."""
     if not FOOTBALL_DATA_KEY:
         raise RuntimeError("FOOTBALL_DATA_KEY not set")
+    if _fd_is_cooling_down():
+        raise RuntimeError("football-data cooldown active after rate limit")
     _fd_rate_limit()
     headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
-    resp = requests.get(
-        f"{FOOTBALL_DATA_BASE}/{endpoint}",
-        headers=headers,
-        params=params or {},
-        timeout=15,
-    )
-    resp.raise_for_status()
+    try:
+        resp = requests.get(
+            f"{FOOTBALL_DATA_BASE}/{endpoint}",
+            headers=headers,
+            params=params or {},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 429:
+            _fd_start_cooldown()
+            raise RuntimeError("football-data rate limit hit; cooling down") from exc
+        raise
     return resp.json()
 
 
@@ -351,7 +374,7 @@ def get_team_results(team_name: str, count: int = 10) -> list[dict]:
                 all_results.append(r)
 
     # Source 1: football-data.org (primary — best coverage, free, current season)
-    if FOOTBALL_DATA_KEY:
+    if FOOTBALL_DATA_KEY and not _fd_is_cooling_down():
         fd_id = fd_find_team_id(team_name)
         if fd_id:
             results = fd_get_team_matches(fd_id, limit=count)

@@ -59,6 +59,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CONCURRENT_UPDATES = max(1, int(os.getenv("CONCURRENT_UPDATES", "8") or 8))
 REFRESH_CONCURRENCY = max(1, int(os.getenv("REFRESH_CONCURRENCY", "4") or 4))
 BOOKING_FETCH_CONCURRENCY = max(1, int(os.getenv("BOOKING_FETCH_CONCURRENCY", "4") or 4))
+TEAM_RESULTS_FETCH_CONCURRENCY = max(1, int(os.getenv("TEAM_RESULTS_FETCH_CONCURRENCY", "2") or 2))
 
 # Conversation states for /check flow
 CHECK_CODES, CHECK_TARGET_ODDS, CHECK_EXCLUDE, CHECK_CONFIRM, CHECK_EXPAND, CHECK_REVIEW = range(6)
@@ -145,6 +146,36 @@ def _mark_job_finish(
     elif error is not None:
         state["last_error_at"] = _utc_now_iso()
         state["last_error"] = f"{type(error).__name__}: {error}"
+
+
+def _team_results_cache_key(team_name: str, count: int) -> str:
+    """Stable key for per-run team results caching."""
+    return f"{team_name.strip().lower()}::{count}"
+
+
+async def _get_team_results_cached(
+    context: ContextTypes.DEFAULT_TYPE,
+    team_name: str,
+    *,
+    count: int = 10,
+) -> list[dict]:
+    """Reuse team results within one bot flow and cap concurrent fetches."""
+    cache = context.user_data.setdefault("_team_results_cache", {})
+    key = _team_results_cache_key(team_name, count)
+    if key in cache:
+        return cache[key]
+
+    semaphore = context.application.bot_data.get("team_results_semaphore")
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(TEAM_RESULTS_FETCH_CONCURRENCY)
+        context.application.bot_data["team_results_semaphore"] = semaphore
+
+    async with semaphore:
+        if key in cache:
+            return cache[key]
+        results = await asyncio.to_thread(get_team_results, team_name, count=count)
+        cache[key] = results
+        return results
 
 
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -882,6 +913,7 @@ def _clear_pick_runtime(context: ContextTypes.DEFAULT_TYPE) -> None:
         "active_ticket_index",
         "pick_change_idx",
         "pick_change_alts",
+        "_team_results_cache",
     ]:
         context.user_data.pop(key, None)
 
@@ -1407,8 +1439,8 @@ async def _pick_analyze_from_message(message, context, target: float):
 
             try:
                 home_results, away_results = await asyncio.gather(
-                    asyncio.to_thread(get_team_results, home_name, count=10),
-                    asyncio.to_thread(get_team_results, away_name, count=10),
+                    _get_team_results_cached(context, home_name, count=10),
+                    _get_team_results_cached(context, away_name, count=10),
                 )
 
                 if not home_results or not away_results:
@@ -3750,8 +3782,8 @@ async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
 
             # 2. Fetch form data for scoring
             home_results, away_results = await asyncio.gather(
-                asyncio.to_thread(get_team_results, home_name, count=10),
-                asyncio.to_thread(get_team_results, away_name, count=10),
+                _get_team_results_cached(context, home_name, count=10),
+                _get_team_results_cached(context, away_name, count=10),
             )
 
             home_form = _summarize_form(home_results) if home_results else None
@@ -4074,8 +4106,8 @@ async def check_expand_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
         try:
             home_results, away_results = await asyncio.gather(
-                asyncio.to_thread(get_team_results, home_name, count=10),
-                asyncio.to_thread(get_team_results, away_name, count=10),
+                _get_team_results_cached(context, home_name, count=10),
+                _get_team_results_cached(context, away_name, count=10),
             )
             if not home_results or not away_results:
                 continue
