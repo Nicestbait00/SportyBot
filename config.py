@@ -64,7 +64,132 @@ LEAGUES: dict[str, int] = {
     "ucl": 2,   # alias
 }
 
-# ── Strategy presets ──────────────────────────────────────────────────────────
+# ── Available markets (SportyBet market IDs) ─────────────────────────────────
+# All markets the user can toggle on/off. Key = internal label, value = metadata.
+AVAILABLE_MARKETS: dict[str, dict] = {
+    # ── Core markets ──
+    "1X2": {
+        "sportybet_id": "1",
+        "description": "Home / Draw / Away",
+        "outcomes": {"1": "Home", "2": "Draw", "3": "Away"},
+    },
+    "Over/Under": {
+        "sportybet_id": "18",
+        "description": "Total goals Over/Under",
+        "outcomes": {"12": "Over", "13": "Under"},
+        "specifier": True,
+    },
+    "GG/NG": {
+        "sportybet_id": "29",
+        "description": "Both Teams To Score",
+        "outcomes": {"74": "GG (Yes)", "76": "NG (No)"},
+    },
+    "Double Chance": {
+        "sportybet_id": "10",
+        "description": "1X / 12 / X2",
+        "outcomes": {"9": "1X", "10": "12", "11": "X2"},
+    },
+    # ── Win markets ──
+    "Draw No Bet": {
+        "sportybet_id": "11",
+        "description": "Home or Away (draw = void)",
+        "outcomes": {"4": "Home", "5": "Away"},
+    },
+    # ── Goals markets ──
+    "Home Over/Under": {
+        "sportybet_id": "19",
+        "description": "Home team goals Over/Under",
+        "outcomes": {"12": "Over", "13": "Under"},
+        "specifier": True,
+    },
+    "Away Over/Under": {
+        "sportybet_id": "20",
+        "description": "Away team goals Over/Under",
+        "outcomes": {"12": "Over", "13": "Under"},
+        "specifier": True,
+    },
+    "Odd/Even": {
+        "sportybet_id": "26",
+        "description": "Total goals Odd or Even",
+        "outcomes": {"70": "Odd", "72": "Even"},
+    },
+    "Exact Goals": {
+        "sportybet_id": "21",
+        "description": "Exact number of goals (0-6+)",
+        "outcomes": {},
+        "specifier": True,
+    },
+    # ── Combo markets ──
+    "1X2 & GG/NG": {
+        "sportybet_id": "35",
+        "description": "Result + Both Teams Score combo",
+        "outcomes": {"78": "Home & GG", "80": "Home & NG", "82": "Draw & GG", "84": "Draw & NG", "86": "Away & GG", "88": "Away & NG"},
+    },
+    "1X2 & Over/Under": {
+        "sportybet_id": "37",
+        "description": "Result + Over/Under combo",
+        "outcomes": {},
+        "specifier": True,
+    },
+    "Over/Under & GG/NG": {
+        "sportybet_id": "36",
+        "description": "Over/Under + BTTS combo",
+        "outcomes": {"90": "Over 2.5 & GG", "92": "Under 2.5 & GG", "94": "Over 2.5 & NG", "96": "Under 2.5 & NG"},
+        "specifier": True,
+    },
+    # ── Half-time markets ──
+    "HT 1X2": {
+        "sportybet_id": "60",
+        "description": "Half-Time result",
+        "outcomes": {"1": "Home", "2": "Draw", "3": "Away"},
+    },
+    "HT/FT": {
+        "sportybet_id": "47",
+        "description": "Half-Time / Full-Time",
+        "outcomes": {"418": "H/H", "420": "H/D", "422": "H/A", "424": "D/H", "426": "D/D", "428": "D/A", "430": "A/H", "432": "A/D", "434": "A/A"},
+    },
+    "HT Over/Under": {
+        "sportybet_id": "68",
+        "description": "1st Half Over/Under",
+        "outcomes": {"12": "Over", "13": "Under"},
+        "specifier": True,
+    },
+    "HT GG/NG": {
+        "sportybet_id": "75",
+        "description": "1st Half Both Teams Score",
+        "outcomes": {"74": "Yes", "76": "No"},
+    },
+    # ── Clean sheet / scoring ──
+    "Home Clean Sheet": {
+        "sportybet_id": "31",
+        "description": "Home keeps clean sheet",
+        "outcomes": {"74": "Yes", "76": "No"},
+    },
+    "Away Clean Sheet": {
+        "sportybet_id": "32",
+        "description": "Away keeps clean sheet",
+        "outcomes": {"74": "Yes", "76": "No"},
+    },
+    # ── Handicap ──
+    "Handicap": {
+        "sportybet_id": "14",
+        "description": "European Handicap (0:1, 1:0, etc.)",
+        "outcomes": {"1711": "Home", "1712": "Draw", "1713": "Away"},
+        "specifier": True,
+    },
+    # ── Correct Score ──
+    "Correct Score": {
+        "sportybet_id": "45",
+        "description": "Exact final score",
+        "outcomes": {},
+    },
+}
+
+# Default enabled markets for new users
+DEFAULT_ENABLED_MARKETS = ["1X2", "Over/Under", "GG/NG"]
+
+# Legacy strategy presets — kept for backward compatibility with saved configs
+# New system uses direct config values instead
 STRATEGY_PRESETS: dict[str, dict] = {
     "conservative": {
         "label": "Conservative",
@@ -160,7 +285,10 @@ LEAGUE_NAMES: dict[int, str] = {v: k.replace("_", " ").title() for k, v in LEAGU
 
 DEFAULT_USER_CONFIG = {
     "leagues": [39, 140, 135, 78, 61],  # Top 5 European leagues
-    "strategy": "balanced",
+    "strategy": "balanced",  # Legacy — kept for migration
+    "min_confidence": 75,    # New config: 0-100
+    "min_odds": 1.05,        # New config: minimum odds per pick
+    "enabled_markets": ["1X2", "Over/Under", "GG/NG"],  # New config: toggled markets
     "days_ahead": 14,
     "timeframe": "7days",  # Default timeframe preset
     "telegram_chat_ids": [],

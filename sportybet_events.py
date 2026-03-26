@@ -117,7 +117,7 @@ def fetch_all_events(
                 SPORTYBET_API,
                 params={
                     "sportId": "sr:sport:1",
-                    "marketId": "1,18,29,10",  # 1X2, Over/Under, GG/NG, Double Chance
+                    "marketId": "1,10,11,14,18,19,20,21,26,29,31,32,35,36,37,45,47,60,68,75",
                     "pageSize": 100,
                     "pageNum": page,
                 },
@@ -393,97 +393,335 @@ def build_booking_selection(event: dict, market_type: str, pick: str) -> Optiona
     """
     Build a SportyBet booking selection from an event and pick.
 
-    market_type: "1X2", "Over/Under", "GG/NG"
-    pick: "Home", "Away", "Draw", "Over (total=1.5)", "Over (total=2.5)", "GG", etc.
+    market_type: "1X2", "Over/Under", "GG/NG", "Double Chance", "Draw No Bet",
+                 "Odd/Even", "1X2 & GG/NG", "HT 1X2", "HT/FT", "HT Over/Under",
+                 "HT GG/NG", "Home Clean Sheet", "Away Clean Sheet",
+                 "Over/Under & GG/NG", "1X2 & Over/Under", "Correct Score",
+                 "Handicap", "Exact Goals", "Home Team Goals", "Away Team Goals"
+    pick: "Home", "Away", "Draw", "Over (total=1.5)", "GG", "Odd", "Even",
+          "Home & GG", "H/H", etc.
 
     Returns dict ready for the SportyBet share API:
         {"eventId": "sr:match:XXX", "marketId": "1", "outcomeId": "1", "specifier": ""}
     """
     markets = event.get("markets", {})
     pick_lower = pick.lower()
+    mt_lower = market_type.lower()
 
-    # Determine market ID and outcome ID
-    if "1x2" in market_type.lower() or "winner" in market_type.lower():
-        market = markets.get("1", {})
-        outcomes = market.get("outcomes", {})
-
-        if "home" in pick_lower or pick_lower == "1":
-            outcome = outcomes.get("1", {})
-        elif "away" in pick_lower or pick_lower == "2":
-            outcome = outcomes.get("3", {})
-        elif "draw" in pick_lower or pick_lower == "x":
-            outcome = outcomes.get("2", {})
-        else:
-            return None
-
+    def _make(market_id: str, outcome_id: str, specifier: str = "", odds: str = "0"):
         return {
             "eventId": event["eventId"],
-            "marketId": "1",
-            "outcomeId": outcome.get("id", "1"),
-            "specifier": "",
-            "odds": outcome.get("odds", "0"),
-        }
-
-    elif "over" in market_type.lower() or "under" in market_type.lower() or "over" in pick_lower or "under" in pick_lower:
-        # Determine specifier (total=1.5, total=2.5, etc.)
-        specifier = ""
-        if "total=" in pick_lower:
-            try:
-                specifier = pick_lower.split("(")[1].rstrip(")")
-            except (IndexError, ValueError):
-                specifier = "total=2.5"
-        elif "0.5" in pick_lower:
-            specifier = "total=0.5"
-        elif "1.5" in pick_lower:
-            specifier = "total=1.5"
-        elif "2.5" in pick_lower:
-            specifier = "total=2.5"
-        elif "3.5" in pick_lower:
-            specifier = "total=3.5"
-        else:
-            specifier = "total=2.5"
-
-        # Look up the specific goal line via compound key "18|total=X.5"
-        market = markets.get(f"18|{specifier}", {})
-        if not market:
-            # Fallback: try plain "18"
-            market = markets.get("18", {})
-
-        is_over = "over" in pick_lower
-        outcome_id = "12" if is_over else "13"
-
-        outcomes = market.get("outcomes", {})
-        odds = outcomes.get(outcome_id, {}).get("odds", "0")
-
-        return {
-            "eventId": event["eventId"],
-            "marketId": "18",
+            "marketId": market_id,
             "outcomeId": outcome_id,
             "specifier": specifier,
             "odds": odds,
         }
 
-    elif "gg" in market_type.lower() or "ng" in market_type.lower() or "btts" in market_type.lower() or "gg" in pick_lower:
-        # GG/NG is market 29, NOT 14 (14 = Handicap)
+    def _find_outcome(market_dict_key: str, outcome_id: str, spec: str = ""):
+        mkt = markets.get(market_dict_key, {})
+        o = mkt.get("outcomes", {}).get(outcome_id, {})
+        return o.get("odds", "0")
+
+    # ── 1X2 (market 1) ──
+    if mt_lower == "1x2":
+        market = markets.get("1", {})
+        outcomes = market.get("outcomes", {})
+        if "home" in pick_lower or pick_lower == "1":
+            oid = "1"
+        elif "away" in pick_lower or pick_lower == "2":
+            oid = "3"
+        elif "draw" in pick_lower or pick_lower == "x":
+            oid = "2"
+        else:
+            return None
+        return _make("1", oid, "", outcomes.get(oid, {}).get("odds", "0"))
+
+    # ── Double Chance (market 10) ──
+    if mt_lower == "double chance":
+        market = markets.get("10", {})
+        outcomes = market.get("outcomes", {})
+        if "1x" in pick_lower or "home or draw" in pick_lower:
+            oid = "9"
+        elif "12" in pick_lower or "home or away" in pick_lower:
+            oid = "10"
+        elif "x2" in pick_lower or "draw or away" in pick_lower:
+            oid = "11"
+        else:
+            return None
+        return _make("10", oid, "", outcomes.get(oid, {}).get("odds", "0"))
+
+    # ── Draw No Bet (market 11) ──
+    if mt_lower == "draw no bet":
+        market = markets.get("11", {})
+        outcomes = market.get("outcomes", {})
+        oid = "4" if "home" in pick_lower else "5"
+        return _make("11", oid, "", outcomes.get(oid, {}).get("odds", "0"))
+
+    # ── Handicap (market 14) ──
+    if mt_lower == "handicap":
+        # Pick format: "Home (1:0)" or "Away (0:1)" etc.
+        specifier = ""
+        if "hcp=" in pick_lower:
+            try:
+                specifier = pick_lower.split("(")[1].rstrip(")")
+            except (IndexError, ValueError):
+                specifier = "hcp=1:0"
+        else:
+            # Try to extract from pick text like "Home (1:0)"
+            import re
+            m = re.search(r'\((\d+:\d+)\)', pick)
+            if m:
+                specifier = f"hcp={m.group(1)}"
+        mkt_key = f"14|{specifier}" if specifier else "14"
+        mkt = markets.get(mkt_key, {})
+        outcomes = mkt.get("outcomes", {})
+        if "home" in pick_lower:
+            oid = "1711"
+        elif "draw" in pick_lower:
+            oid = "1712"
+        else:
+            oid = "1713"
+        return _make("14", oid, specifier, outcomes.get(oid, {}).get("odds", "0"))
+
+    # ── Over/Under (market 18) — also handles HT Over/Under (68) ──
+    if mt_lower == "over/under":
+        specifier = _extract_total_specifier(pick_lower)
+        mkt_key = f"18|{specifier}"
+        mkt = markets.get(mkt_key, markets.get("18", {}))
+        is_over = "over" in pick_lower
+        oid = "12" if is_over else "13"
+        odds = mkt.get("outcomes", {}).get(oid, {}).get("odds", "0")
+        return _make("18", oid, specifier, odds)
+
+    # ── Home Over/Under (market 19) ──
+    if mt_lower == "home over/under":
+        specifier = _extract_total_specifier(pick_lower)
+        mkt_key = f"19|{specifier}"
+        mkt = markets.get(mkt_key, markets.get("19", {}))
+        is_over = "over" in pick_lower
+        oid = "12" if is_over else "13"
+        odds = mkt.get("outcomes", {}).get(oid, {}).get("odds", "0")
+        return _make("19", oid, specifier, odds)
+
+    # ── Away Over/Under (market 20) ──
+    if mt_lower == "away over/under":
+        specifier = _extract_total_specifier(pick_lower)
+        mkt_key = f"20|{specifier}"
+        mkt = markets.get(mkt_key, markets.get("20", {}))
+        is_over = "over" in pick_lower
+        oid = "12" if is_over else "13"
+        odds = mkt.get("outcomes", {}).get(oid, {}).get("odds", "0")
+        return _make("20", oid, specifier, odds)
+
+    # ── HT Over/Under (market 68) ──
+    if mt_lower in ("ht over/under", "1st half over/under"):
+        specifier = _extract_total_specifier(pick_lower)
+        mkt_key = f"68|{specifier}"
+        mkt = markets.get(mkt_key, markets.get("68", {}))
+        is_over = "over" in pick_lower
+        oid = "12" if is_over else "13"
+        odds = mkt.get("outcomes", {}).get(oid, {}).get("odds", "0")
+        return _make("68", oid, specifier, odds)
+
+    # ── GG/NG (market 29) ──
+    if mt_lower in ("gg/ng", "btts"):
         market = markets.get("29", {})
         outcomes = market.get("outcomes", {})
+        oid = "74" if ("gg" in pick_lower or "yes" in pick_lower) else "76"
+        return _make("29", oid, "", outcomes.get(oid, {}).get("odds", "0"))
 
-        if "gg" in pick_lower or "yes" in pick_lower:
-            outcome_id = "74"
-        else:
-            outcome_id = "76"
+    # ── HT GG/NG (market 75) ──
+    if mt_lower in ("ht gg/ng", "1st half gg/ng"):
+        market = markets.get("75", {})
+        outcomes = market.get("outcomes", {})
+        oid = "74" if ("yes" in pick_lower or "gg" in pick_lower) else "76"
+        return _make("75", oid, "", outcomes.get(oid, {}).get("odds", "0"))
 
-        odds = outcomes.get(outcome_id, {}).get("odds", "0")
+    # ── Odd/Even (market 26) ──
+    if mt_lower == "odd/even":
+        market = markets.get("26", {})
+        outcomes = market.get("outcomes", {})
+        oid = "70" if "odd" in pick_lower else "72"
+        return _make("26", oid, "", outcomes.get(oid, {}).get("odds", "0"))
 
-        return {
-            "eventId": event["eventId"],
-            "marketId": "29",
-            "outcomeId": outcome_id,
-            "specifier": "",
-            "odds": odds,
+    # ── Exact Goals (market 21) ──
+    if mt_lower == "exact goals":
+        # Pick format: "2" or "3+" etc
+        market = markets.get("21", markets.get("21|variant=sr:exact_goals:6+", {}))
+        # Search across all market 21 variants
+        for k, mkt in markets.items():
+            if mkt.get("id") == "21":
+                for oid, o in mkt.get("outcomes", {}).items():
+                    if o.get("name", "").lower().strip() == pick_lower.strip():
+                        return _make("21", oid, mkt.get("specifier", ""), o.get("odds", "0"))
+        return None
+
+    # ── Home Team Goals (market 23) ──
+    if mt_lower == "home team goals":
+        for k, mkt in markets.items():
+            if mkt.get("id") == "23":
+                for oid, o in mkt.get("outcomes", {}).items():
+                    if o.get("name", "").lower().strip() == pick_lower.strip():
+                        return _make("23", oid, mkt.get("specifier", ""), o.get("odds", "0"))
+        return None
+
+    # ── Away Team Goals (market 24) ──
+    if mt_lower == "away team goals":
+        for k, mkt in markets.items():
+            if mkt.get("id") == "24":
+                for oid, o in mkt.get("outcomes", {}).items():
+                    if o.get("name", "").lower().strip() == pick_lower.strip():
+                        return _make("24", oid, mkt.get("specifier", ""), o.get("odds", "0"))
+        return None
+
+    # ── Home Clean Sheet (market 31) ──
+    if mt_lower == "home clean sheet":
+        market = markets.get("31", {})
+        outcomes = market.get("outcomes", {})
+        oid = "74" if "yes" in pick_lower else "76"
+        return _make("31", oid, "", outcomes.get(oid, {}).get("odds", "0"))
+
+    # ── Away Clean Sheet (market 32) ──
+    if mt_lower == "away clean sheet":
+        market = markets.get("32", {})
+        outcomes = market.get("outcomes", {})
+        oid = "74" if "yes" in pick_lower else "76"
+        return _make("32", oid, "", outcomes.get(oid, {}).get("odds", "0"))
+
+    # ── 1X2 & GG/NG (market 35) ──
+    if mt_lower == "1x2 & gg/ng":
+        market = markets.get("35", {})
+        outcomes = market.get("outcomes", {})
+        outcome_map = {
+            "home & gg": "78", "home & yes": "78",
+            "home & ng": "80", "home & no": "80",
+            "draw & gg": "82", "draw & yes": "82",
+            "draw & ng": "84", "draw & no": "84",
+            "away & gg": "86", "away & yes": "86",
+            "away & ng": "88", "away & no": "88",
         }
+        oid = outcome_map.get(pick_lower, "")
+        if not oid:
+            # Fuzzy match
+            for label, o_id in outcome_map.items():
+                if all(w in pick_lower for w in label.split(" & ")):
+                    oid = o_id
+                    break
+        if oid:
+            return _make("35", oid, "", outcomes.get(oid, {}).get("odds", "0"))
+        return None
+
+    # ── Over/Under & GG/NG (market 36) ──
+    if mt_lower == "over/under & gg/ng":
+        specifier = "total=2.5"  # Default
+        if "total=" in pick_lower:
+            try:
+                specifier = pick_lower.split("(")[1].rstrip(")")
+            except (IndexError, ValueError):
+                pass
+        mkt_key = f"36|{specifier}"
+        mkt = markets.get(mkt_key, markets.get("36", {}))
+        outcomes = mkt.get("outcomes", {})
+        if "over" in pick_lower and ("gg" in pick_lower or "yes" in pick_lower):
+            oid = "90"
+        elif "under" in pick_lower and ("gg" in pick_lower or "yes" in pick_lower):
+            oid = "92"
+        elif "over" in pick_lower and ("ng" in pick_lower or "no" in pick_lower):
+            oid = "94"
+        elif "under" in pick_lower and ("ng" in pick_lower or "no" in pick_lower):
+            oid = "96"
+        else:
+            return None
+        return _make("36", oid, specifier, outcomes.get(oid, {}).get("odds", "0"))
+
+    # ── 1X2 & Over/Under (market 37) ──
+    if mt_lower == "1x2 & over/under":
+        specifier = _extract_total_specifier(pick_lower)
+        mkt_key = f"37|{specifier}"
+        mkt = markets.get(mkt_key, markets.get("37", {}))
+        outcomes = mkt.get("outcomes", {})
+        if "home" in pick_lower and "under" in pick_lower:
+            oid = "794"
+        elif "home" in pick_lower and "over" in pick_lower:
+            oid = "796"
+        elif "draw" in pick_lower and "under" in pick_lower:
+            oid = "798"
+        elif "draw" in pick_lower and "over" in pick_lower:
+            oid = "800"
+        elif "away" in pick_lower and "under" in pick_lower:
+            oid = "802"
+        elif "away" in pick_lower and "over" in pick_lower:
+            oid = "804"
+        else:
+            return None
+        return _make("37", oid, specifier, outcomes.get(oid, {}).get("odds", "0"))
+
+    # ── HT 1X2 (market 60) ──
+    if mt_lower in ("ht 1x2", "1st half 1x2"):
+        market = markets.get("60", {})
+        outcomes = market.get("outcomes", {})
+        if "home" in pick_lower:
+            oid = "1"
+        elif "away" in pick_lower:
+            oid = "3"
+        else:
+            oid = "2"
+        return _make("60", oid, "", outcomes.get(oid, {}).get("odds", "0"))
+
+    # ── HT/FT (market 47) ──
+    if mt_lower in ("ht/ft", "half time/full time"):
+        market = markets.get("47", {})
+        outcomes = market.get("outcomes", {})
+        ht_ft_map = {
+            "h/h": "418", "home/home": "418",
+            "h/d": "420", "home/draw": "420",
+            "h/a": "422", "home/away": "422",
+            "d/h": "424", "draw/home": "424",
+            "d/d": "426", "draw/draw": "426",
+            "d/a": "428", "draw/away": "428",
+            "a/h": "430", "away/home": "430",
+            "a/d": "432", "away/draw": "432",
+            "a/a": "434", "away/away": "434",
+        }
+        oid = ht_ft_map.get(pick_lower.replace(" ", ""), "")
+        if not oid:
+            # Try fuzzy
+            for label, o_id in ht_ft_map.items():
+                if label.replace("/", "") in pick_lower.replace("/", "").replace(" ", ""):
+                    oid = o_id
+                    break
+        if oid:
+            return _make("47", oid, "", outcomes.get(oid, {}).get("odds", "0"))
+        return None
+
+    # ── Correct Score (market 45) ──
+    if mt_lower == "correct score":
+        market = markets.get("45", {})
+        outcomes = market.get("outcomes", {})
+        # Pick format: "1:0", "2:1", etc.
+        import re
+        score_match = re.search(r'(\d+:\d+)', pick)
+        if score_match:
+            score_str = score_match.group(1)
+            for oid, o in outcomes.items():
+                if o.get("name", "").strip() == score_str:
+                    return _make("45", oid, "", o.get("odds", "0"))
+        return None
 
     return None
+
+
+def _extract_total_specifier(pick_lower: str) -> str:
+    """Extract total=X.X specifier from a pick string."""
+    if "total=" in pick_lower:
+        try:
+            return pick_lower.split("(")[1].rstrip(")")
+        except (IndexError, ValueError):
+            pass
+    for val in ["0.5", "1.5", "2.5", "3.5", "4.5", "5.5"]:
+        if val in pick_lower:
+            return f"total={val}"
+    return "total=2.5"
 
 
 def create_booking_code(selections: list[dict]) -> Optional[str]:

@@ -56,13 +56,51 @@ def score_match(
         "btts":     {"confidence": int, "reasons": list[str]}
     """
     sig = extra_signals or {}
+    hw = _score_home_win(home_form, away_form, home_results, away_results, sig)
+    aw = _score_away_win(home_form, away_form, home_results, away_results, sig)
+    over_05 = _score_over(home_form, away_form, home_results, away_results, 0.5, sig)
+    over_15 = _score_over(home_form, away_form, home_results, away_results, 1.5, sig)
+    over_25 = _score_over(home_form, away_form, home_results, away_results, 2.5, sig)
+    btts = _score_btts(home_form, away_form, home_results, away_results, sig)
+
     return {
-        "home_win": _score_home_win(home_form, away_form, home_results, away_results, sig),
-        "away_win": _score_away_win(home_form, away_form, home_results, away_results, sig),
-        "over_0.5": _score_over(home_form, away_form, home_results, away_results, 0.5, sig),
-        "over_1.5": _score_over(home_form, away_form, home_results, away_results, 1.5, sig),
-        "over_2.5": _score_over(home_form, away_form, home_results, away_results, 2.5, sig),
-        "btts": _score_btts(home_form, away_form, home_results, away_results, sig),
+        "home_win": hw,
+        "away_win": aw,
+        "over_0.5": over_05,
+        "over_1.5": over_15,
+        "over_2.5": over_25,
+        "btts": btts,
+        # ── Extended markets (derived from core scores) ──
+        "draw": _score_draw(home_form, away_form, home_results, away_results, sig),
+        "double_chance_1x": _score_double_chance(hw, "draw", home_form, away_form, home_results, away_results, sig, "1X"),
+        "double_chance_x2": _score_double_chance(aw, "draw", home_form, away_form, home_results, away_results, sig, "X2"),
+        "double_chance_12": _score_double_chance(hw, aw, home_form, away_form, home_results, away_results, sig, "12"),
+        "draw_no_bet_home": _score_draw_no_bet(hw, home_form, away_form, sig, "home"),
+        "draw_no_bet_away": _score_draw_no_bet(aw, home_form, away_form, sig, "away"),
+        "odd_goals": _score_odd_even(home_form, away_form, home_results, away_results, "odd"),
+        "even_goals": _score_odd_even(home_form, away_form, home_results, away_results, "even"),
+        "home_clean_sheet": _score_clean_sheet(home_form, away_form, home_results, away_results, "home"),
+        "away_clean_sheet": _score_clean_sheet(home_form, away_form, home_results, away_results, "away"),
+        "ht_home": _score_ht_result(home_form, away_form, home_results, away_results, "home"),
+        "ht_draw": _score_ht_result(home_form, away_form, home_results, away_results, "draw"),
+        "ht_away": _score_ht_result(home_form, away_form, home_results, away_results, "away"),
+        "ht_over_0.5": _score_ht_over(home_form, away_form, home_results, away_results, 0.5),
+        "ht_over_1.5": _score_ht_over(home_form, away_form, home_results, away_results, 1.5),
+        "ht_btts": _score_ht_btts(home_form, away_form, home_results, away_results),
+        # Combo markets
+        "home_and_gg": _score_combo(hw, btts, "Home & GG"),
+        "home_and_ng": _score_combo_neg(hw, btts, "Home & NG"),
+        "away_and_gg": _score_combo(aw, btts, "Away & GG"),
+        "away_and_ng": _score_combo_neg(aw, btts, "Away & NG"),
+        "home_and_over_2.5": _score_combo(hw, over_25, "Home & Over 2.5"),
+        "away_and_over_2.5": _score_combo(aw, over_25, "Away & Over 2.5"),
+        "over_2.5_and_gg": _score_combo(over_25, btts, "Over 2.5 & GG"),
+        "under_2.5_and_ng": _score_combo_neg(over_25, btts, "Under 2.5 & NG"),
+        # Home/Away team totals
+        "home_over_0.5": _score_team_over(home_form, home_results, 0.5, "home"),
+        "home_over_1.5": _score_team_over(home_form, home_results, 1.5, "home"),
+        "away_over_0.5": _score_team_over(away_form, away_results, 0.5, "away"),
+        "away_over_1.5": _score_team_over(away_form, away_results, 1.5, "away"),
     }
 
 
@@ -394,6 +432,234 @@ def _score_btts(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> dict:
     confidence = max(0, min(95, int(raw)))
 
     return {"confidence": confidence, "reasons": reasons}
+
+
+# ── Draw ──────────────────────────────────────────────────────────────────
+
+def _score_draw(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> dict:
+    """Score likelihood of a draw."""
+    reasons = []
+
+    # Draw rate for both teams
+    home_draws = hf["draws"] / max(hf["played"], 1)
+    away_draws = af["draws"] / max(af["played"], 1)
+    combined = (home_draws + away_draws) / 2
+    s1 = combined * 40
+
+    reasons.append(f"Draw rate: Home {hf['draws']}/{hf['played']}, Away {af['draws']}/{af['played']}")
+
+    # Closeness of team quality (small GD gap = more draws)
+    home_gd = hf["avg_scored"] - hf["avg_conceded"]
+    away_gd = af["avg_scored"] - af["avg_conceded"]
+    gd_gap = abs(home_gd - away_gd)
+    closeness = max(0, 1 - gd_gap / 2)
+    s2 = closeness * 30
+
+    if closeness > 0.6:
+        reasons.append(f"Teams closely matched (GD gap: {gd_gap:.1f})")
+
+    # Recent draws
+    recent_home_draws = sum(1 for r in hr[:5] if r["result"] == "D")
+    recent_away_draws = sum(1 for r in ar[:5] if r["result"] == "D")
+    s3 = ((recent_home_draws + recent_away_draws) / 10) * 30
+
+    raw = s1 + s2 + s3
+    confidence = max(0, min(95, int(raw)))
+    return {"confidence": confidence, "reasons": reasons}
+
+
+# ── Double Chance ────────────────────────────────────────────────────────
+
+def _score_double_chance(win_score: dict, other: any, hf: dict, af: dict, hr: list, ar: list, sig: dict, label: str) -> dict:
+    """Score double chance market (1X, X2, 12)."""
+    reasons = []
+
+    if label == "1X":
+        # Home or Draw — complement of Away Win
+        home_non_loss = (hf["wins"] + hf["draws"]) / max(hf["played"], 1)
+        conf = int(min(95, home_non_loss * 80 + 10))
+        reasons.append(f"Home non-loss rate: {home_non_loss*100:.0f}%")
+    elif label == "X2":
+        away_non_loss = (af["wins"] + af["draws"]) / max(af["played"], 1)
+        conf = int(min(95, away_non_loss * 80 + 10))
+        reasons.append(f"Away non-loss rate: {away_non_loss*100:.0f}%")
+    elif label == "12":
+        # Either team wins — complement of Draw
+        home_draws = hf["draws"] / max(hf["played"], 1)
+        away_draws = af["draws"] / max(af["played"], 1)
+        draw_prob = (home_draws + away_draws) / 2
+        conf = int(min(95, (1 - draw_prob) * 85 + 5))
+        reasons.append(f"Non-draw rate: {(1-draw_prob)*100:.0f}%")
+    else:
+        conf = 50
+
+    return {"confidence": conf, "reasons": reasons}
+
+
+# ── Draw No Bet ──────────────────────────────────────────────────────────
+
+def _score_draw_no_bet(win_score: dict, hf: dict, af: dict, sig: dict, side: str) -> dict:
+    """Score Draw No Bet — essentially a boosted win confidence."""
+    # DNB is safer than straight win — draws refund your stake
+    base_conf = win_score["confidence"]
+    # Boost by estimated draw probability (since draws don't lose)
+    draw_boost = min(15, int((hf["draws"] + af["draws"]) / max(hf["played"] + af["played"], 1) * 30))
+    conf = min(95, base_conf + draw_boost)
+    reasons = win_score["reasons"][:] + [f"Draw refund boost: +{draw_boost}%"]
+    return {"confidence": conf, "reasons": reasons}
+
+
+# ── Odd/Even ─────────────────────────────────────────────────────────────
+
+def _score_odd_even(hf: dict, af: dict, hr: list, ar: list, parity: str) -> dict:
+    """Score Odd or Even total goals."""
+    reasons = []
+
+    # Count odd/even totals in recent games
+    all_results = hr + ar
+    totals = [r["goals_for"] + r["goals_against"] for r in all_results]
+
+    if parity == "odd":
+        count = sum(1 for t in totals if t % 2 == 1)
+    else:
+        count = sum(1 for t in totals if t % 2 == 0)
+
+    rate = count / max(len(totals), 1)
+    # Odd/Even is close to 50/50 — confidence rarely goes above 65
+    conf = int(min(70, 30 + rate * 45))
+    reasons.append(f"{parity.title()} goals in {count}/{len(totals)} recent games ({rate*100:.0f}%)")
+
+    return {"confidence": conf, "reasons": reasons}
+
+
+# ── Clean Sheet ──────────────────────────────────────────────────────────
+
+def _score_clean_sheet(hf: dict, af: dict, hr: list, ar: list, side: str) -> dict:
+    """Score clean sheet probability."""
+    reasons = []
+
+    if side == "home":
+        # Home team keeping a clean sheet = opponent doesn't score
+        cs_count = sum(1 for r in hr if r["goals_against"] == 0)
+        cs_rate = cs_count / max(len(hr), 1)
+        opp_fail = sum(1 for r in ar if r["goals_for"] == 0)
+        opp_fail_rate = opp_fail / max(len(ar), 1)
+        combined = (cs_rate * 0.6 + opp_fail_rate * 0.4)
+        reasons.append(f"Home CS rate: {cs_count}/{len(hr)}, Away blanks: {opp_fail}/{len(ar)}")
+    else:
+        cs_count = sum(1 for r in ar if r["goals_against"] == 0)
+        cs_rate = cs_count / max(len(ar), 1)
+        opp_fail = sum(1 for r in hr if r["goals_for"] == 0)
+        opp_fail_rate = opp_fail / max(len(hr), 1)
+        combined = (cs_rate * 0.6 + opp_fail_rate * 0.4)
+        reasons.append(f"Away CS rate: {cs_count}/{len(ar)}, Home blanks: {opp_fail}/{len(hr)}")
+
+    conf = int(min(90, combined * 85 + 5))
+    return {"confidence": conf, "reasons": reasons}
+
+
+# ── Half-Time Markets ────────────────────────────────────────────────────
+
+def _score_ht_result(hf: dict, af: dict, hr: list, ar: list, result_type: str) -> dict:
+    """Score half-time result. Uses full-time data as proxy with dampening."""
+    reasons = []
+
+    # HT is harder to predict — dampen full-time signals
+    if result_type == "home":
+        base_rate = hf["wins"] / max(hf["played"], 1)
+        conf = int(min(80, base_rate * 55 + 10))
+        reasons.append(f"Home FT win rate: {hf['wins']}/{hf['played']} (HT dampened)")
+    elif result_type == "away":
+        base_rate = af["wins"] / max(af["played"], 1)
+        conf = int(min(80, base_rate * 50 + 8))
+        reasons.append(f"Away FT win rate: {af['wins']}/{af['played']} (HT dampened)")
+    else:
+        # Draws are more common at HT
+        draw_rate = (hf["draws"] + af["draws"]) / max(hf["played"] + af["played"], 1)
+        conf = int(min(80, draw_rate * 60 + 25))
+        reasons.append(f"Draw tendency (HT more likely): {draw_rate*100:.0f}%")
+
+    return {"confidence": conf, "reasons": reasons}
+
+
+def _score_ht_over(hf: dict, af: dict, hr: list, ar: list, threshold: float) -> dict:
+    """Score 1st Half Over. Uses overall scoring rate * ~0.45 (HT share of goals)."""
+    reasons = []
+
+    ht_factor = 0.45  # ~45% of goals scored in 1st half on average
+    expected_total = (hf["avg_scored"] + af["avg_conceded"] + af["avg_scored"] + hf["avg_conceded"]) / 2
+    ht_expected = expected_total * ht_factor
+
+    excess = max(0, ht_expected - threshold)
+    conf = int(min(85, 25 + excess * 35))
+    reasons.append(f"Expected HT goals: ~{ht_expected:.1f} (from {expected_total:.1f} FT expected)")
+
+    return {"confidence": conf, "reasons": reasons}
+
+
+def _score_ht_btts(hf: dict, af: dict, hr: list, ar: list) -> dict:
+    """Score 1st Half BTTS. Much harder than FT BTTS — dampen heavily."""
+    reasons = []
+
+    # FT BTTS rate * dampening factor
+    home_btts = sum(1 for r in hr if r["goals_for"] >= 1 and r["goals_against"] >= 1)
+    away_btts = sum(1 for r in ar if r["goals_for"] >= 1 and r["goals_against"] >= 1)
+    ft_rate = (home_btts / max(len(hr), 1) + away_btts / max(len(ar), 1)) / 2
+
+    # HT BTTS happens maybe 40% as often as FT BTTS
+    ht_rate = ft_rate * 0.4
+    conf = int(min(70, ht_rate * 80 + 10))
+    reasons.append(f"FT BTTS rate: {ft_rate*100:.0f}% → HT estimate: {ht_rate*100:.0f}%")
+
+    return {"confidence": conf, "reasons": reasons}
+
+
+# ── Team Totals ──────────────────────────────────────────────────────────
+
+def _score_team_over(form: dict, results: list, threshold: float, side: str) -> dict:
+    """Score team-specific Over (home/away team to score over X)."""
+    reasons = []
+
+    over_count = sum(1 for r in results if r["goals_for"] > threshold)
+    over_rate = over_count / max(len(results), 1)
+    avg_scored = form["avg_scored"]
+
+    s1 = over_rate * 50
+    excess = max(0, avg_scored - threshold)
+    s2 = min(1, excess / 1.5) * 30
+
+    # Poisson for team goals
+    poisson_prob = _poisson_over_prob(avg_scored, threshold)
+    s3 = poisson_prob * 20
+
+    conf = int(min(95, s1 + s2 + s3))
+    reasons.append(f"{side.title()} scores >{threshold} in {over_count}/{len(results)} games (avg: {avg_scored:.1f})")
+
+    return {"confidence": conf, "reasons": reasons}
+
+
+# ── Combo Market Helpers ─────────────────────────────────────────────────
+
+def _score_combo(score_a: dict, score_b: dict, label: str) -> dict:
+    """Score a combo market (both conditions must hit). Multiply probabilities."""
+    prob_a = score_a["confidence"] / 100
+    prob_b = score_b["confidence"] / 100
+    combined = prob_a * prob_b
+    conf = int(min(90, combined * 100))
+    reasons = [f"{label}: {score_a['confidence']}% × {score_b['confidence']}% = {conf}%"]
+    reasons.extend(score_a["reasons"][:1])
+    reasons.extend(score_b["reasons"][:1])
+    return {"confidence": conf, "reasons": reasons}
+
+
+def _score_combo_neg(win_score: dict, neg_score: dict, label: str) -> dict:
+    """Score combo where second condition is NEGATED (e.g. Home & NG = Home win + NOT BTTS)."""
+    prob_a = win_score["confidence"] / 100
+    prob_b_neg = 1 - (neg_score["confidence"] / 100)
+    combined = prob_a * prob_b_neg
+    conf = int(min(90, combined * 100))
+    reasons = [f"{label}: {win_score['confidence']}% × {100 - neg_score['confidence']}% = {conf}%"]
+    return {"confidence": conf, "reasons": reasons}
 
 
 # ── Extra Signal Processors ────────────────────────────────────────────────

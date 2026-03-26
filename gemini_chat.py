@@ -21,10 +21,12 @@ GEMINI_URL = (
 )
 
 SYSTEM_PROMPT = """\
-You are SportyBot, a friendly football betting assistant on Telegram.
+You are SportyBot, a sharp but friendly football betting assistant on Telegram.
+
+Your personality: Knowledgeable, confident, slightly casual — like a mate who genuinely knows football data. You're warm but efficient. Use conversational language, not corporate speak. Short replies (1-2 sentences). You can use occasional slang or football expressions but keep it natural.
 
 Your ONLY role is to understand what the user wants and return structured JSON.
-You do NOT make pick decisions — the deterministic engine handles that.
+You do NOT make pick decisions — the deterministic scoring engine handles that.
 
 Return a JSON object (no markdown fences, no extra text) with these fields:
 {
@@ -60,13 +62,64 @@ Intent definitions:
   params — empty {}
 
 Rules:
-- If the user says "hi", "hello", "hey" etc. → intent "chat", friendly greeting reply mentioning they can ask for picks.
-- If the user says something like "get me picks", "find me a bet", "5 odds" → intent "pick".
+- If the user says "hi", "hello", "hey" etc. → intent "chat", warm greeting reply. Be personable.
+- If the user says something like "get me picks", "find me a bet", "5 odds", "what's good today", "anything hitting?" → intent "pick".
 - If the user mentions a booking code (alphanumeric ~6-10 chars) → intent "check".
 - If the user asks "how is Arsenal doing", "Chelsea form" → intent "stats".
-- If ambiguous, default to "chat" with a helpful reply.
-- Keep replies short (1-3 sentences).
+- If ambiguous, default to "chat" with a helpful reply asking what they need.
+- Keep replies warm but concise (1-2 sentences). Sound like a knowledgeable friend, not a robot.
 - ALWAYS return valid JSON only. No markdown code fences.
+"""
+
+
+# Prompt for understanding user messages during an active combo review session
+REVIEW_PROMPT = """\
+You are SportyBot's review assistant. The user is currently reviewing a {combo_size}-pick betting combo.
+
+Your job: understand what the user wants to do with their current combo and return structured JSON.
+
+The current combo has {combo_size} picks numbered 1-{combo_size}.
+
+Return JSON (no markdown fences):
+{{
+  "intent": "<one of: edit, book, explain, reshuffle, chat>",
+  "params": {{ ... }},
+  "reply": "A short, warm response to the user"
+}}
+
+Intent definitions:
+- "edit": The user wants to modify the combo.
+  params.actions: list of actions, each:
+    {{"type": "remove", "index": <1-based pick number>}}
+    {{"type": "change", "index": <1-based pick number>, "market": "over"|"home"|"away"|"btts"|"draw", "threshold": <float for over, e.g. 0.5, 1.5, 2.5> or null}}
+  Examples:
+    "take out 1 and 3" → actions: [{{"type":"remove","index":1}},{{"type":"remove","index":3}}]
+    "I don't like game 5" → actions: [{{"type":"remove","index":5}}]
+    "make 2 an over 1.5" → actions: [{{"type":"change","index":2,"market":"over","threshold":1.5}}]
+    "switch 4 to home win" → actions: [{{"type":"change","index":4,"market":"home","threshold":null}}]
+    "get rid of the last one and change 3 to btts" → actions: [{{"type":"remove","index":{combo_size}}},{{"type":"change","index":3,"market":"btts","threshold":null}}]
+
+- "book": The user wants to confirm and book the combo.
+  Triggered by: "book it", "let's go", "send it", "looks good", "confirm", "yes", "lock it", "place it", "bet", "cool", "perfect", "nice", "that works", "I'm happy", "done", or any affirmative/approval language.
+  params: {{}}
+
+- "explain": The user wants to understand WHY a specific pick (or all picks) were chosen.
+  Triggered by: "why pick 3?", "explain", "tell me more about 5", "why that one?", "break it down", "synopsis", "why?", "how confident are you about 2?"
+  params.picks: list of 1-based pick numbers to explain, or [] for all picks
+
+- "reshuffle": The user wants different picks for the same target.
+  Triggered by: "give me different ones", "reshuffle", "try again", "new picks", "other options", "not feeling these", "different combo"
+  params: {{}}
+
+- "chat": The user is asking something unrelated or you genuinely can't understand.
+  If you're unsure what they mean, ask for clarification in the reply. Be helpful, not dismissive.
+  params: {{}}
+
+Rules:
+- Be smart about understanding intent. "nah" after seeing picks = "reshuffle". "that's fire" = "book".
+- If the user says something ambiguous like "hmm" or "idk", ask what they'd like to do in a friendly way.
+- Keep replies warm and concise. You're a knowledgeable mate, not a customer service bot.
+- ALWAYS return valid JSON only.
 """
 
 
@@ -158,6 +211,114 @@ def chat(message: str, context: dict = None) -> dict:
     except Exception as e:
         logger.warning(f"Gemini chat error: {e}")
         return _fallback_parse(message)
+
+
+def parse_review_message(message: str, combo_size: int) -> dict:
+    """
+    Parse a user message during combo review using Gemini.
+
+    Returns dict with keys: intent, params, reply
+    Intent is one of: edit, book, explain, reshuffle, chat
+    """
+    if not GEMINI_API_KEY:
+        return _fallback_review_parse(message, combo_size)
+
+    prompt = REVIEW_PROMPT.format(combo_size=combo_size)
+    user_text = f"User says: {message}"
+
+    body = {
+        "contents": [
+            {"parts": [{"text": user_text}]}
+        ],
+        "systemInstruction": {
+            "parts": [{"text": prompt}]
+        },
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 512,
+        },
+    }
+
+    try:
+        resp = requests.post(
+            GEMINI_URL,
+            params={"key": GEMINI_API_KEY},
+            json=body,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        text = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
+
+        text = text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+
+        result = json.loads(text)
+
+        if "intent" not in result:
+            result["intent"] = "chat"
+        if "params" not in result:
+            result["params"] = {}
+        if "reply" not in result:
+            result["reply"] = ""
+
+        allowed = {"edit", "book", "explain", "reshuffle", "chat"}
+        if result["intent"] not in allowed:
+            result["intent"] = "chat"
+
+        return result
+
+    except json.JSONDecodeError:
+        logger.warning(f"Gemini review parse non-JSON: {text[:200] if 'text' in dir() else '(no text)'}")
+        return _fallback_review_parse(message, combo_size)
+    except Exception as e:
+        logger.warning(f"Gemini review parse error: {e}")
+        return _fallback_review_parse(message, combo_size)
+
+
+def _fallback_review_parse(message: str, combo_size: int) -> dict:
+    """Regex fallback for review message parsing."""
+    msg = message.lower().strip()
+
+    # Book intent
+    book_words = ("book", "confirm", "yes", "keep", "lock", "go ahead", "place",
+                  "bet", "lets go", "let's go", "do it", "send it", "cool",
+                  "perfect", "nice", "that works", "looks good", "done", "fire",
+                  "lgtm", "good", "great", "ok", "okay", "sure", "yep", "yeah",
+                  "absolutely", "definitely", "for sure", "ship it", "i'm happy")
+    if msg in book_words or any(msg.startswith(w) for w in ("book ", "confirm ", "yes ")):
+        return {"intent": "book", "params": {}, "reply": ""}
+
+    # Reshuffle intent
+    reshuffle_words = ("reshuffle", "shuffle", "different", "other", "try again",
+                       "new picks", "not feeling", "nah", "nope", "meh",
+                       "give me different", "other options", "change all")
+    if any(w in msg for w in reshuffle_words):
+        return {"intent": "reshuffle", "params": {}, "reply": ""}
+
+    # Explain intent
+    explain_words = ("why", "explain", "tell me more", "break it down", "synopsis",
+                     "how confident", "reasoning", "what makes", "data behind")
+    if any(w in msg for w in explain_words):
+        nums = re.findall(r"\d+", msg)
+        picks = [int(n) for n in nums if 1 <= int(n) <= combo_size]
+        return {"intent": "explain", "params": {"picks": picks}, "reply": ""}
+
+    # Edit intent — check for remove/change patterns
+    if any(w in msg for w in ("remove", "drop", "delete", "exclude", "take out",
+                               "get rid", "change", "swap", "switch", "make")):
+        return {"intent": "edit", "params": {}, "reply": ""}
+
+    return {"intent": "chat", "params": {}, "reply": ""}
 
 
 def _parse_market_slots(msg: str) -> list | None:

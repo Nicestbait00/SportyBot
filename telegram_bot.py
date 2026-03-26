@@ -31,6 +31,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 from config import (
+    AVAILABLE_MARKETS,
+    DEFAULT_ENABLED_MARKETS,
     LEAGUE_NAMES,
     LEAGUES,
     STRATEGY_PRESETS,
@@ -53,7 +55,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 # Conversation states for /check flow
-CHECK_CODES, CHECK_TARGET_ODDS, CHECK_EXCLUDE, CHECK_CONFIRM, CHECK_EXPAND = range(5)
+CHECK_CODES, CHECK_TARGET_ODDS, CHECK_EXCLUDE, CHECK_CONFIRM, CHECK_EXPAND, CHECK_REVIEW = range(6)
 # Conversation states for /pick flow
 PICK_ODDS, PICK_REVIEW = range(10, 12)
 # Conversation states for /strategy custom flow
@@ -447,28 +449,156 @@ async def send_long_message(update_or_msg, text: str):
             await msg_target.reply_text(chunk)
 
 
-# ── Strategy helpers ──────────────────────────────────────────────────────────
+# ── Extended market pick generator ────────────────────────────────────────────
 
-def _get_strategy_config(user_config: dict) -> dict:
-    """Return the effective strategy dict for a user config.
+def _add_extended_picks(
+    all_scored: list,
+    scores: dict,
+    markets: dict,
+    base_pick: dict,
+    data_quality: str,
+    _verdict,
+):
+    """Generate picks for extended markets from scorer output + real SportyBet odds."""
 
-    If the user chose a preset (string), look it up in STRATEGY_PRESETS.
-    If the user built a custom strategy (dict), return it directly.
-    Falls back to the 'balanced' preset.
+    def _get_market_odds(market_key: str, outcome_id: str) -> float:
+        mkt = markets.get(market_key, {})
+        o = mkt.get("outcomes", {}).get(outcome_id, {})
+        try:
+            return float(o.get("odds", "0"))
+        except (ValueError, TypeError):
+            return 0.0
+
+    def _add(market_name, pick_label, score_key, market_key, outcome_id, rating="moderate"):
+        sc = scores.get(score_key)
+        if not sc:
+            return
+        odds = _get_market_odds(market_key, outcome_id)
+        if odds <= 1.0:
+            return
+        checked = cross_check_with_odds(sc["confidence"], odds)
+        conf = checked["confidence"]
+        reasons = sc["reasons"][:]
+        if checked["warning"]:
+            reasons.append(checked["warning"])
+        if conf >= 40:
+            all_scored.append({
+                **base_pick,
+                "market": market_name, "pick": pick_label,
+                "odds": odds,
+                "confidence": conf, "data_confidence": conf,
+                "verdict": _verdict(conf),
+                "analysis_reasons": reasons,
+                "suggestion": None, "data_quality": data_quality,
+                "rating": rating,
+            })
+
+    # ── Draw (market 1, outcome 2) ──
+    _add("1X2", "Draw", "draw", "1", "2")
+
+    # ── Double Chance (market 10) ──
+    _add("Double Chance", "1X", "double_chance_1x", "10", "9", "safe")
+    _add("Double Chance", "X2", "double_chance_x2", "10", "11", "safe")
+    _add("Double Chance", "12", "double_chance_12", "10", "10", "safe")
+
+    # ── Draw No Bet (market 11) ──
+    _add("Draw No Bet", "Home", "draw_no_bet_home", "11", "4", "safe")
+    _add("Draw No Bet", "Away", "draw_no_bet_away", "11", "5")
+
+    # ── Odd/Even (market 26) ──
+    _add("Odd/Even", "Odd", "odd_goals", "26", "70")
+    _add("Odd/Even", "Even", "even_goals", "26", "72")
+
+    # ── Home Clean Sheet (market 31) ──
+    _add("Home Clean Sheet", "Yes", "home_clean_sheet", "31", "74")
+
+    # ── Away Clean Sheet (market 32) ──
+    _add("Away Clean Sheet", "Yes", "away_clean_sheet", "32", "74")
+
+    # ── HT 1X2 (market 60) ──
+    _add("HT 1X2", "Home", "ht_home", "60", "1")
+    _add("HT 1X2", "Draw", "ht_draw", "60", "2")
+    _add("HT 1X2", "Away", "ht_away", "60", "3")
+
+    # ── HT Over/Under (market 68) ──
+    for threshold in [0.5, 1.5]:
+        mkt_key = f"68|total={threshold}"
+        _add("HT Over/Under", f"Over (total={threshold})", f"ht_over_{threshold}", mkt_key, "12")
+
+    # ── HT GG/NG (market 75) ──
+    _add("HT GG/NG", "Yes", "ht_btts", "75", "74")
+
+    # ── 1X2 & GG/NG (market 35) ──
+    _add("1X2 & GG/NG", "Home & GG", "home_and_gg", "35", "78")
+    _add("1X2 & GG/NG", "Home & NG", "home_and_ng", "35", "80")
+    _add("1X2 & GG/NG", "Away & GG", "away_and_gg", "35", "86")
+    _add("1X2 & GG/NG", "Away & NG", "away_and_ng", "35", "88")
+
+    # ── 1X2 & Over/Under (market 37) ──
+    _add("1X2 & Over/Under", "Home & Over (total=2.5)", "home_and_over_2.5", "37|total=2.5", "796")
+    _add("1X2 & Over/Under", "Away & Over (total=2.5)", "away_and_over_2.5", "37|total=2.5", "804")
+
+    # ── Over/Under & GG/NG (market 36) ──
+    _add("Over/Under & GG/NG", "Over 2.5 & GG", "over_2.5_and_gg", "36|total=2.5", "90")
+    _add("Over/Under & GG/NG", "Under 2.5 & NG", "under_2.5_and_ng", "36|total=2.5", "96")
+
+    # ── Home Over/Under (market 19) — team-specific over/under ──
+    for threshold in [0.5, 1.5]:
+        mkt_key = f"19|total={threshold}"
+        _add("Home Over/Under", f"Over (total={threshold})", f"home_over_{threshold}", mkt_key, "12")
+
+    # ── Away Over/Under (market 20) ──
+    for threshold in [0.5, 1.5]:
+        mkt_key = f"20|total={threshold}"
+        _add("Away Over/Under", f"Over (total={threshold})", f"away_over_{threshold}", mkt_key, "12")
+
+
+# ── Config helpers ────────────────────────────────────────────────────────────
+
+def _get_pick_config(user_config: dict) -> dict:
+    """Return the effective pick configuration.
+
+    New config system uses direct values (min_confidence, min_odds, enabled_markets).
+    Falls back to legacy strategy presets for old saved configs.
     """
+    # New-style config: direct values present
+    if "min_confidence" in user_config and "enabled_markets" in user_config:
+        return {
+            "min_confidence": user_config.get("min_confidence", 75),
+            "min_odds": user_config.get("min_odds", 1.05),
+            "preferred_markets": user_config.get("enabled_markets", DEFAULT_ENABLED_MARKETS),
+        }
+    # Legacy: strategy preset or custom dict
     strat = user_config.get("strategy", "balanced")
     if isinstance(strat, dict):
         return strat
     return STRATEGY_PRESETS.get(strat, STRATEGY_PRESETS["balanced"])
 
 
-def _get_strategy_label(user_config: dict) -> str:
-    """Human-readable label for the user's current strategy."""
+def _get_strategy_config(user_config: dict) -> dict:
+    """Alias for backward compatibility — delegates to _get_pick_config."""
+    return _get_pick_config(user_config)
+
+
+def _get_config_label(user_config: dict) -> str:
+    """Human-readable label for the user's current config."""
+    if "min_confidence" in user_config and "enabled_markets" in user_config:
+        markets = user_config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
+        return (
+            f"Min {user_config['min_confidence']}% conf, "
+            f"≥{user_config.get('min_odds', 1.05)} odds, "
+            f"{len(markets)} markets"
+        )
     strat = user_config.get("strategy", "balanced")
     if isinstance(strat, dict):
         return strat.get("label", "Custom")
     preset = STRATEGY_PRESETS.get(strat, STRATEGY_PRESETS["balanced"])
     return preset["label"]
+
+
+def _get_strategy_label(user_config: dict) -> str:
+    """Alias for backward compatibility."""
+    return _get_config_label(user_config)
 
 
 # ── Command handlers ─────────────────────────────────────────────────────────
@@ -482,26 +612,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tf_label = TIMEFRAME_PRESETS.get(config.get("timeframe", "7days"), {}).get("label", "7 days")
 
     msg = (
-        "Welcome to SportyBot\n\n"
-        "I analyze football matches and build betting combos with auto-booking on SportyBet.\n\n"
-        "Just chat naturally:\n"
+        "Hey! Welcome to SportyBot ⚽\n\n"
+        "I crunch form data, odds, and stats to find the best betting combos — "
+        "then book them straight to SportyBet.\n\n"
+        "Just tell me what you need:\n"
         "  \"Give me 20 odds\"\n"
         "  \"3 wins, 5 over 1.5 for 30 odds\"\n"
-        "  \"Arsenal form\"\n\n"
-        "After picks show, you can say:\n"
+        "  \"How's Arsenal doing?\"\n\n"
+        "When I show you picks, you can:\n"
         "  \"remove 1, 3\" — drop games\n"
         "  \"change 5 to over 2.5\" — swap markets\n"
+        "  \"why pick 3?\" — get the data breakdown\n"
         "  \"book it\" — generate SportyBet code\n\n"
-        "Commands:\n"
-        "/pick — Get picks\n"
-        "/check — Analyze a booking code\n"
-        "/leagues — Toggle leagues\n"
-        "/timeframe — Set time window\n"
-        "/strategy — Set betting strategy\n"
-        "/status — Current config\n\n"
-        f"Leagues: {', '.join(league_names) if league_names else 'All'}\n"
-        f"Timeframe: {tf_label}\n"
-        f"Strategy: {_get_strategy_label(config)}"
+        "Quick commands:\n"
+        "/pick — Get picks  •  /check — Analyze a code\n"
+        "/leagues — Toggle leagues  •  /strategy — Settings\n\n"
+        f"📋 {', '.join(league_names) if league_names else 'All leagues'} | {tf_label}\n"
+        f"⚙️ {_get_config_label(config)}"
     )
     await update.message.reply_text(msg)
 
@@ -931,6 +1058,12 @@ async def _pick_analyze_from_message(message, context, target: float):
                             "rating": "moderate",
                         })
 
+                # ── Extended markets ──
+                _add_extended_picks(
+                    all_scored, scores, markets, base_pick,
+                    data_quality, _verdict,
+                )
+
             else:
                 # ── Odds-only analysis (no form data available) ──
                 # Cap confidence low — odds are market prices, not analysis
@@ -1031,13 +1164,13 @@ async def _pick_build_combo(message, context):
     target = context.user_data.get("pick_target", 10)
     shuffle_seed = context.user_data.get("pick_shuffle_seed", 0)
 
-    # Load user strategy
+    # Load user config (new config system)
     chat_id = context.user_data.get("chat_id")
     config = load_user_config(chat_id=chat_id)
-    strat = _get_strategy_config(config)
-    min_confidence = strat.get("min_confidence", 55)
-    preferred_markets = strat.get("preferred_markets", ["1X2", "Over/Under", "GG/NG"])
-    over_threshold = strat.get("over_threshold", 1.5)
+    pick_cfg = _get_pick_config(config)
+    min_confidence = pick_cfg.get("min_confidence", 75)
+    preferred_markets = pick_cfg.get("preferred_markets", DEFAULT_ENABLED_MARKETS)
+    min_pick_odds = pick_cfg.get("min_odds", 1.05)
 
     # Filter out excluded and odds-only picks (no real form data)
     available = [
@@ -1049,16 +1182,14 @@ async def _pick_build_combo(message, context):
     market_slots = context.user_data.get("pick_market_slots")
 
     if market_slots:
-        # Natural language request — skip strategy filters entirely
+        # Natural language request — skip config filters entirely
         # The user explicitly told us what they want
         pass
     else:
-        # Apply strategy market filter
+        # Apply market filter from config
         def _market_allowed(p):
             market = p.get("market", "")
-            if market not in preferred_markets and market not in ("1X2", "Over/Under", "GG/NG"):
-                return False
-            return True
+            return market in preferred_markets
         available = [p for p in available if _market_allowed(p)]
 
     # Sort by confidence, with slight randomness on reshuffle
@@ -1068,7 +1199,7 @@ async def _pick_build_combo(message, context):
     else:
         available.sort(key=lambda p: p["confidence"], reverse=True)
 
-    # Build combo: filter by strategy thresholds only when no market_slots
+    # Build combo: filter by config thresholds only when no market_slots
     if market_slots:
         # Trust the user's explicit request — only filter out bad data
         qualified = [
@@ -1077,7 +1208,6 @@ async def _pick_build_combo(message, context):
             and p.get("odds", 0) > 1.0
         ]
     else:
-        min_pick_odds = strat.get("min_odds", 1.10)
         qualified = [
             p for p in available
             if p["confidence"] >= min_confidence
@@ -1193,8 +1323,8 @@ async def _pick_build_combo(message, context):
 
     if not selected:
         await message.reply_text(
-            "Not enough confident picks for this target.\n"
-            "Try /timeframe to widen the window or /leagues to add more leagues."
+            "Couldn't find enough strong picks for that target right now.\n"
+            "Try widening the window with /timeframe or adding more leagues with /leagues."
         )
         return ConversationHandler.END
 
@@ -1281,7 +1411,7 @@ async def _pick_build_combo(message, context):
 
     msg = "\n".join(lines)
 
-    # Exclude + change market + reshuffle + confirm buttons
+    # Exclude + change market + reshuffle + confirm + explain buttons
     buttons = []
     for i, p in enumerate(selected):
         row = [
@@ -1291,11 +1421,14 @@ async def _pick_build_combo(message, context):
         buttons.append(row)
 
     buttons.append([
+        InlineKeyboardButton("📖 Why these?", callback_data="pick_explain_all"),
         InlineKeyboardButton("🔄 Reshuffle", callback_data="pick_reshuffle"),
-        InlineKeyboardButton("✅ Keep these", callback_data="pick_confirm"),
+    ])
+    buttons.append([
+        InlineKeyboardButton("✅ Lock it in", callback_data="pick_confirm"),
     ])
 
-    msg += "\n\nExclude, reshuffle, or confirm:"
+    msg += "\n\nEdit, explain, reshuffle, or lock it in:"
     await message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons))
 
     return PICK_REVIEW
@@ -1308,7 +1441,7 @@ async def _pick_confirm_and_book(message, context):
         await message.reply_text("No picks to book. Use /pick to start.")
         return ConversationHandler.END
 
-    await message.reply_text("📲 Booking on SportyBet...")
+    await message.reply_text("📲 Generating your SportyBet booking code...")
 
     total_odds = 1.0
     for p in combo:
@@ -1380,6 +1513,12 @@ async def pick_review_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    if data == "pick_explain_all":
+        combo = context.user_data.get("pick_combo", [])
+        if combo:
+            await _explain_picks(query.message, context, combo, [])
+        return PICK_REVIEW
 
     if data == "pick_confirm":
         combo = context.user_data.get("pick_combo", [])
@@ -1465,8 +1604,11 @@ async def pick_review_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             if not sporty_event:
                 sporty_event = await asyncio.to_thread(find_event, pick["home"], pick["away"])
 
+            # Store alternatives so the handler can look them up by index
+            context.user_data["pick_change_alts"] = match_alts
+
             buttons = []
-            for alt in match_alts:
+            for alt_idx, alt in enumerate(match_alts):
                 conf = alt.get("confidence", 0)
                 odds = alt.get("odds", 0)
                 market = alt.get("market", "")
@@ -1480,23 +1622,17 @@ async def pick_review_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     label = f"{pick_str} Win" if pick_str in ("Home", "Away") else pick_str
                 elif market == "GG/NG":
                     label = "BTTS Yes" if pick_str == "GG" else pick_str
+                elif market == "HT Over/Under":
+                    t = _pick_threshold(alt)
+                    label = f"HT Over {t}" if t else f"HT {pick_str}"
                 else:
                     label = f"{market}: {pick_str}"
 
                 display = f"{label} @ {odds:.2f} [{conf}%]"
                 lines.append(f"  {display}")
 
-                # Map to callback data format
-                if market == "1X2":
-                    oid = "1" if pick_str == "Home" else "3"
-                    cb = f"pick_mkt_{idx}_1x2_{oid}"
-                elif market == "Over/Under":
-                    t = _pick_threshold(alt) or "1.5"
-                    cb = f"pick_mkt_{idx}_ou_{t}"
-                elif market == "GG/NG":
-                    cb = f"pick_mkt_{idx}_gg_"
-                else:
-                    continue
+                # Generic callback: pick_mkt_{combo_idx}_alt_{alt_idx}
+                cb = f"pick_mkt_{idx}_alt_{alt_idx}"
 
                 # Top reason from analysis
                 reasons = alt.get("analysis_reasons", [])
@@ -1529,63 +1665,36 @@ async def pick_review_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return await _pick_build_combo(query.message, context)
 
         pick = combo[idx]
-        sporty_event = pick.get("_sporty_event")
-        if not sporty_event:
-            sporty_event = await asyncio.to_thread(find_event, pick["home"], pick["away"])
 
-        markets = sporty_event.get("markets", {}) if sporty_event else {}
-
-        # Parse the callback: pick_mkt_{idx}_{type}_{extra}
+        # Parse: pick_mkt_{combo_idx}_alt_{alt_idx}
         parts = data.split("_")
-        # parts: ['pick', 'mkt', idx, type, ...]
-        mkt_type = parts[3] if len(parts) > 3 else ""
+        # parts: ['pick', 'mkt', combo_idx, 'alt', alt_idx]
+        if len(parts) >= 5 and parts[3] == "alt":
+            alt_idx = int(parts[4])
+            alts = context.user_data.get("pick_change_alts", [])
+            if 0 <= alt_idx < len(alts):
+                alt = alts[alt_idx]
+                old_desc = f"{pick['market']}: {pick['pick']} @ {pick['odds']:.2f}"
 
-        new_market = pick["market"]
-        new_pick = pick["pick"]
-        new_odds = pick["odds"]
+                # Copy all relevant fields from the alternative
+                pick["market"] = alt["market"]
+                pick["pick"] = alt["pick"]
+                pick["odds"] = alt.get("odds", pick["odds"])
+                pick["confidence"] = alt.get("confidence", pick["confidence"])
+                pick["data_confidence"] = alt.get("data_confidence", pick.get("data_confidence", pick["confidence"]))
+                pick["verdict"] = alt.get("verdict", pick.get("verdict", "moderate"))
+                pick["analysis_reasons"] = alt.get("analysis_reasons", [])
+                pick["suggestion"] = None
 
-        if mkt_type == "1x2":
-            oid = parts[4] if len(parts) > 4 else ""
-            m = markets.get("1", {})
-            o = m.get("outcomes", {}).get(oid, {})
-            name_map = {"1": "Home", "2": "Draw", "3": "Away"}
-            new_market = "1X2"
-            new_pick = name_map.get(oid, o.get("name", "Home"))
-            new_odds = float(o.get("odds", pick["odds"]))
+                await query.edit_message_text(
+                    f"🔄 Changed #{idx+1}: {old_desc}\n"
+                    f"   → {pick['market']}: {pick['pick']} @ {pick['odds']:.2f}\nRebuilding..."
+                )
+            else:
+                await query.edit_message_text("Alternative not found.\nRebuilding...")
+        else:
+            await query.edit_message_text("Rebuilding...")
 
-        elif mkt_type == "ou":
-            threshold = parts[4] if len(parts) > 4 else "2.5"
-            m = markets.get(f"18|total={threshold}", {})
-            o = m.get("outcomes", {}).get("12", {})
-            new_market = "Over/Under"
-            new_pick = f"Over (total={threshold})"
-            new_odds = float(o.get("odds", pick["odds"]))
-
-        elif mkt_type == "gg":
-            m = markets.get("29", {})
-            o = m.get("outcomes", {}).get("74", {})
-            new_market = "GG/NG"
-            new_pick = "GG"
-            new_odds = float(o.get("odds", pick["odds"]))
-
-        elif mkt_type == "dc":
-            oid = parts[4] if len(parts) > 4 else ""
-            m = markets.get("10", {})
-            o = m.get("outcomes", {}).get(oid, {})
-            new_market = "Double Chance"
-            new_pick = o.get("name", "")
-            new_odds = float(o.get("odds", pick["odds"]))
-
-        # Update the pick in-place
-        old_desc = f"{pick['market']}: {pick['pick']} @ {pick['odds']:.2f}"
-        pick["market"] = new_market
-        pick["pick"] = new_pick
-        pick["odds"] = new_odds
-
-        await query.edit_message_text(
-            f"🔄 Changed #{idx+1}: {old_desc}\n"
-            f"   → {new_market}: {new_pick} @ {new_odds:.2f}\nRebuilding..."
-        )
         return await _pick_build_combo(query.message, context)
 
     elif data.startswith("pick_exclude_"):
@@ -1601,40 +1710,132 @@ async def pick_review_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def pick_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle natural language edits to the current combo during PICK_REVIEW.
-
-    Examples:
-      "remove games 1, 2 and 5"
-      "change game 7 to over 1.5"
-      "swap 3 to home win and 9 to btts"
-    """
+    """Handle natural language during PICK_REVIEW — semantic understanding via Gemini."""
     text = update.message.text.strip()
-    text_lower = text.lower()
     combo = context.user_data.get("pick_combo", [])
     if not combo:
         await update.message.reply_text("No active combo. Use /pick to start.")
         return ConversationHandler.END
 
-    # Check for confirm/book intent
-    book_phrases = ("book it", "book", "confirm", "yes", "keep", "lock it", "lock", "go ahead", "place it", "bet", "lets go", "let's go", "do it")
-    if text_lower in book_phrases or any(text_lower.startswith(p) for p in ("book ", "confirm ", "yes ")):
-        # Simulate the confirm button press
+    # Route through semantic layer (Gemini understands intent)
+    result = await asyncio.to_thread(
+        gemini_chat.parse_review_message, text, len(combo)
+    )
+
+    intent = result.get("intent", "chat")
+    params = result.get("params", {})
+    reply = result.get("reply", "")
+
+    # ── Book ──
+    if intent == "book":
+        if reply:
+            await update.message.reply_text(reply)
         return await _pick_confirm_and_book(update.message, context)
 
-    # Parse edit instructions — try Gemini first, fallback to regex
-    actions = await _parse_combo_edit(text, len(combo))
+    # ── Reshuffle ──
+    if intent == "reshuffle":
+        seed = context.user_data.get("pick_shuffle_seed", 0) + 1
+        context.user_data["pick_shuffle_seed"] = seed
+        await update.message.reply_text(reply or "🔄 Let me find you a different set...")
+        return await _pick_build_combo(update.message, context)
 
-    if not actions:
+    # ── Explain ──
+    if intent == "explain":
+        pick_nums = params.get("picks", [])
+        return await _explain_picks(update.message, context, combo, pick_nums)
+
+    # ── Edit ──
+    if intent == "edit":
+        # Extract actions from params (Gemini structured) or fall back to regex
+        actions = params.get("actions")
+        if not actions:
+            actions = await _parse_combo_edit(text, len(combo))
+
+        if not actions:
+            await update.message.reply_text(
+                reply or "Hmm, I'm not sure what you want to change. You can say things like:\n"
+                "• \"drop 1 and 3\"\n"
+                "• \"make 2 an over 1.5\"\n"
+                "• \"switch 4 to home win\""
+            )
+            return PICK_REVIEW
+
+        return await _apply_combo_edits(update.message, context, combo, actions)
+
+    # ── Chat (unclear / conversational) ──
+    if reply:
+        await update.message.reply_text(reply)
+    else:
         await update.message.reply_text(
-            "Couldn't understand that edit. Try:\n"
-            "• \"remove 1, 3, 5\"\n"
-            "• \"change 2 to over 1.5\"\n"
-            "• \"swap 4 to home win\""
+            "I'm here if you need anything! You can:\n"
+            "• Edit picks (\"remove 2\", \"change 5 to over 1.5\")\n"
+            "• Ask why (\"explain pick 3\", \"why that one?\")\n"
+            "• Confirm (\"book it\", \"looks good\")\n"
+            "• Reshuffle (\"give me different ones\")"
         )
-        return PICK_REVIEW
+    return PICK_REVIEW
 
-    all_scored = context.user_data.get("pick_all_scored", [])
-    excluded = context.user_data.get("pick_excluded", set())
+
+async def _explain_picks(message, context, combo, pick_nums):
+    """Generate data-backed explanations for picks."""
+    if not pick_nums:
+        pick_nums = list(range(1, len(combo) + 1))  # Explain all
+
+    lines = ["📖 *Pick Synopsis*\n"]
+
+    for num in pick_nums:
+        idx = num - 1
+        if idx < 0 or idx >= len(combo):
+            continue
+        p = combo[idx]
+
+        conf = p.get("data_confidence", p.get("confidence", 0))
+        dq = p.get("data_quality", "unknown")
+        market_label = p.get("pick", "").replace("(total=", "").replace(")", "")
+
+        lines.append(f"*{num}. {p['home']} vs {p['away']}*")
+        lines.append(f"   {p['market']}: {market_label} @ {p['odds']:.2f} [{conf}%]\n")
+
+        # Data quality context
+        if dq == "good":
+            lines.append("   📊 Full form data — last 10 matches per team, venue-split")
+        elif dq == "fair":
+            lines.append("   📉 Partial form data available")
+        elif dq == "limited":
+            lines.append("   ⚠️ Limited data — odds-based estimate only")
+
+        # All analysis reasons (the meat of the explanation)
+        reasons = p.get("analysis_reasons", [])
+        if reasons:
+            lines.append("   *The case for this pick:*")
+            for r in reasons:
+                lines.append(f"   • {r}")
+        else:
+            lines.append("   No detailed breakdown available for this one.")
+
+        # Verdict explanation
+        verdict = p.get("verdict", "")
+        if verdict == "strong":
+            lines.append(f"\n   ✅ Strong — the data backs this one well")
+        elif verdict == "moderate":
+            lines.append(f"\n   🟡 Moderate — solid case but not a slam dunk")
+        elif verdict == "weak":
+            lines.append(f"\n   🟠 Weaker — mainly here to reach the odds target")
+
+        lines.append("")
+
+    await send_long_message(message, "\n".join(lines))
+
+    # Return to the right review state
+    if context.user_data.get("_check_mode"):
+        return CHECK_REVIEW
+    return PICK_REVIEW
+
+
+async def _apply_combo_edits(message, context, combo, actions):
+    """Apply edit actions to the combo (shared between /pick and /check)."""
+    all_scored = context.user_data.get("pick_all_scored", context.user_data.get("check_all_scored", []))
+    excluded = context.user_data.get("pick_excluded", context.user_data.get("check_excluded", set()))
     changes_made = []
 
     for action in actions:
@@ -1644,14 +1845,13 @@ async def pick_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action["type"] == "remove":
             excluded.add(_pick_key(combo[idx]))
-            changes_made.append(f"❌ Removed #{idx+1}: {combo[idx]['home']} vs {combo[idx]['away']}")
+            changes_made.append(f"❌ Dropped #{idx+1}: {combo[idx]['home']} vs {combo[idx]['away']}")
 
         elif action["type"] == "change":
             target_market = action.get("market", "")
             target_threshold = action.get("threshold")
             match_key = f"{combo[idx]['home']}_{combo[idx]['away']}"
 
-            # Find the best alternative matching the requested market
             candidates = [
                 p for p in all_scored
                 if f"{p['home']}_{p['away']}" == match_key
@@ -1680,6 +1880,11 @@ async def pick_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if c["market"] == "GG/NG":
                         replacement = c
                         break
+            elif target_market in ("draw", "x"):
+                for c in sorted(candidates, key=lambda p: p.get("confidence", 0), reverse=True):
+                    if c["market"] == "1X2" and c.get("pick") == "Draw":
+                        replacement = c
+                        break
 
             if replacement:
                 old = f"{combo[idx]['market']}: {combo[idx]['pick']}"
@@ -1691,12 +1896,18 @@ async def pick_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 changes_made.append(f"⚠️ #{idx+1}: couldn't find {target_market} for that match")
 
+    # Update excluded set
     context.user_data["pick_excluded"] = excluded
+    if "check_excluded" in context.user_data:
+        context.user_data["check_excluded"] = excluded
 
     if changes_made:
-        await update.message.reply_text("\n".join(changes_made) + "\n\nRebuilding...")
+        await message.reply_text("\n".join(changes_made) + "\n\nRebuilding...")
 
-    return await _pick_build_combo(update.message, context)
+    # Route back to appropriate build function
+    if context.user_data.get("_check_mode"):
+        return await _check_build_and_show(message, context)
+    return await _pick_build_combo(message, context)
 
 
 async def _parse_combo_edit(text: str, combo_size: int) -> list[dict]:
@@ -1853,18 +2064,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     budget = await asyncio.to_thread(get_api_budget)
     league_names = [LEAGUE_NAMES.get(lid, str(lid)) for lid in config.get("leagues", [])]
 
-    strat_cfg = _get_strategy_config(config)
-    strat_label = _get_strategy_label(config)
-    strat_detail = (
-        f"  Min confidence: {strat_cfg['min_confidence']}%\n"
-        f"  Markets: {', '.join(strat_cfg['preferred_markets'])}\n"
-        f"  Over threshold: {strat_cfg['over_threshold']}"
-    )
+    pick_cfg = _get_pick_config(config)
+    enabled = config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
+    min_conf = config.get("min_confidence", pick_cfg.get("min_confidence", 75))
+    min_odds = config.get("min_odds", pick_cfg.get("min_odds", 1.05))
 
     msg = (
         f"SportyBot Status\n\n"
         f"Leagues: {', '.join(league_names) or 'None'}\n"
-        f"Strategy: {strat_label}\n{strat_detail}\n"
+        f"Confidence: ≥{min_conf}%\n"
+        f"Min Odds: ≥{min_odds}\n"
+        f"Markets: {', '.join(enabled)}\n"
         f"Timeframe: {config.get('days_ahead', 7)} days\n"
         f"API Budget: {budget['remaining']}/{budget['limit']} remaining\n"
         f"Date: {budget['date']}"
@@ -1873,276 +2083,296 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show strategy selection with inline buttons."""
+    """Show settings panel — confidence, markets, min odds."""
     chat_id = update.effective_chat.id
     context.user_data["chat_id"] = chat_id
     config = load_user_config(chat_id=chat_id)
-    current_label = _get_strategy_label(config)
-    strat_cfg = _get_strategy_config(config)
+
+    min_conf = config.get("min_confidence", 75)
+    min_odds = config.get("min_odds", 1.05)
+    enabled = config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
 
     lines = [
-        f"Current strategy: *{current_label}*",
-        f"  Min confidence: {strat_cfg['min_confidence']}%",
-        f"  Min odds/pick: {strat_cfg.get('min_odds', 1.10)}",
-        f"  Markets: {', '.join(strat_cfg['preferred_markets'])}",
-        f"  Over threshold: {strat_cfg['over_threshold']}",
+        "⚙️ *Pick Settings*\n",
+        f"Confidence: ≥{min_conf}%",
+        f"Min Odds: ≥{min_odds}",
+        f"Markets: {', '.join(enabled)}",
         "",
+        "Tap to adjust:",
     ]
 
-    for key, preset in STRATEGY_PRESETS.items():
-        lines.append(f"*{preset['label']}* — {preset['description']}")
-
-    lines.append("\nSelect a preset or build your own:")
-
     buttons = [
-        [
-            InlineKeyboardButton("Conservative", callback_data="strat_conservative"),
-            InlineKeyboardButton("Balanced", callback_data="strat_balanced"),
-        ],
-        [
-            InlineKeyboardButton("Aggressive", callback_data="strat_aggressive"),
-            InlineKeyboardButton("Overs Only", callback_data="strat_overs_only"),
-        ],
-        [
-            InlineKeyboardButton("BTTS Mix", callback_data="strat_btts_mix"),
-            InlineKeyboardButton("Favourites", callback_data="strat_favourites"),
-        ],
-        [
-            InlineKeyboardButton("Custom...", callback_data="strat_custom"),
-            InlineKeyboardButton("Edit current", callback_data="strat_edit"),
-        ],
+        [InlineKeyboardButton(f"🎯 Confidence ({min_conf}%)", callback_data="strat_conf_menu")],
+        [InlineKeyboardButton(f"📊 Markets ({len(enabled)})", callback_data="strat_mkt_menu")],
+        [InlineKeyboardButton(f"💰 Min Odds ({min_odds})", callback_data="strat_odds_menu")],
     ]
     await update.message.reply_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown",
     )
-    return STRAT_CUSTOM_CONFIDENCE  # Reuse this state for initial selection too
+    return STRAT_CUSTOM_CONFIDENCE
 
 
 async def callback_strategy_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle strategy preset button press."""
+    """Handle settings panel navigation."""
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    if data in ("strat_custom", "strat_edit"):
-        # Start custom strategy conversation
-        # If editing, pre-load current strategy values
-        if data == "strat_edit":
-            chat_id = update.effective_chat.id
-            config = load_user_config(chat_id=chat_id)
-            current = _get_strategy_config(config)
-            context.user_data["custom_strategy"] = {
-                "min_confidence": current.get("min_confidence", 55),
-                "preferred_markets": list(current.get("preferred_markets", ["1X2", "Over/Under", "GG/NG"])),
-                "over_threshold": current.get("over_threshold", 1.5),
-                "min_odds": current.get("min_odds", 1.20),
-            }
-            label = f"Editing: {_get_strategy_label(config)}\n\n"
-        else:
-            context.user_data["custom_strategy"] = {}
-            label = ""
+    chat_id = update.effective_chat.id
+    config = load_user_config(chat_id=chat_id)
 
+    if data == "strat_conf_menu":
+        # Show confidence range buttons
+        current = config.get("min_confidence", 75)
         buttons = [
             [
-                InlineKeyboardButton("45%", callback_data="strat_conf_45"),
-                InlineKeyboardButton("55%", callback_data="strat_conf_55"),
+                InlineKeyboardButton(f"{'✅ ' if current == 50 else ''}50%", callback_data="strat_conf_50"),
+                InlineKeyboardButton(f"{'✅ ' if current == 60 else ''}60%", callback_data="strat_conf_60"),
+                InlineKeyboardButton(f"{'✅ ' if current == 65 else ''}65%", callback_data="strat_conf_65"),
             ],
             [
-                InlineKeyboardButton("65%", callback_data="strat_conf_65"),
-                InlineKeyboardButton("75%", callback_data="strat_conf_75"),
+                InlineKeyboardButton(f"{'✅ ' if current == 70 else ''}70%", callback_data="strat_conf_70"),
+                InlineKeyboardButton(f"{'✅ ' if current == 75 else ''}75%", callback_data="strat_conf_75"),
+                InlineKeyboardButton(f"{'✅ ' if current == 80 else ''}80%", callback_data="strat_conf_80"),
             ],
+            [
+                InlineKeyboardButton(f"{'✅ ' if current == 85 else ''}85%", callback_data="strat_conf_85"),
+                InlineKeyboardButton(f"{'✅ ' if current == 90 else ''}90%", callback_data="strat_conf_90"),
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data="strat_back")],
         ]
         await query.edit_message_text(
-            f"{label}Custom Strategy — Step 1/4\n\n"
-            "Minimum confidence for picks:",
+            f"🎯 Minimum Confidence\nCurrent: {current}%\n\n"
+            "Lower = more picks (riskier)\nHigher = fewer picks (safer)\n\n"
+            "Recommended: 75% for balanced results",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return STRAT_CUSTOM_CONFIDENCE
 
-    # Preset selected
-    preset_key = data.replace("strat_", "")
-    preset = STRATEGY_PRESETS.get(preset_key)
-    if not preset:
-        await query.edit_message_text("Unknown strategy. Try /strategy again.")
+    elif data == "strat_mkt_menu":
+        # Show market toggle panel
+        enabled = set(config.get("enabled_markets", DEFAULT_ENABLED_MARKETS))
+        buttons = []
+        for mkt_name, mkt_info in AVAILABLE_MARKETS.items():
+            check = "✅" if mkt_name in enabled else "⬜"
+            state = "on" if mkt_name in enabled else "off"
+            buttons.append([InlineKeyboardButton(
+                f"{check} {mkt_name} — {mkt_info['description']}",
+                callback_data=f"strat_mkt_{state}_{mkt_name}",
+            )])
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="strat_back")])
+        await query.edit_message_text(
+            "📊 Market Selection\nTap to toggle on/off:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return STRAT_CUSTOM_MARKETS
+
+    elif data == "strat_odds_menu":
+        # Show min odds buttons
+        current = config.get("min_odds", 1.05)
+        options = [1.01, 1.05, 1.10, 1.15, 1.20, 1.30, 1.40, 1.60]
+        row1 = []
+        row2 = []
+        for i, o in enumerate(options):
+            mark = "✅ " if abs(current - o) < 0.005 else ""
+            btn = InlineKeyboardButton(f"{mark}{o:.2f}", callback_data=f"strat_minodds_{o:.2f}")
+            if i < 4:
+                row1.append(btn)
+            else:
+                row2.append(btn)
+        buttons = [row1, row2, [InlineKeyboardButton("⬅️ Back", callback_data="strat_back")]]
+        await query.edit_message_text(
+            f"💰 Minimum Odds Per Pick\nCurrent: {current}\n\n"
+            "Lower = allows safer low-odds picks (e.g. Over 0.5)\n"
+            "Higher = filters for bigger odds per pick",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return STRAT_CUSTOM_MIN_ODDS
+
+    elif data == "strat_back":
+        # Back to main settings
+        min_conf = config.get("min_confidence", 75)
+        min_odds = config.get("min_odds", 1.05)
+        enabled = config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
+        buttons = [
+            [InlineKeyboardButton(f"🎯 Confidence ({min_conf}%)", callback_data="strat_conf_menu")],
+            [InlineKeyboardButton(f"📊 Markets ({len(enabled)})", callback_data="strat_mkt_menu")],
+            [InlineKeyboardButton(f"💰 Min Odds ({min_odds})", callback_data="strat_odds_menu")],
+            [InlineKeyboardButton("✅ Done", callback_data="strat_done")],
+        ]
+        await query.edit_message_text(
+            f"⚙️ *Pick Settings*\n\n"
+            f"Confidence: ≥{min_conf}%\n"
+            f"Min Odds: ≥{min_odds}\n"
+            f"Markets: {', '.join(enabled)}\n\n"
+            "Tap to adjust:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown",
+        )
+        return STRAT_CUSTOM_CONFIDENCE
+
+    elif data == "strat_done":
+        min_conf = config.get("min_confidence", 75)
+        min_odds = config.get("min_odds", 1.05)
+        enabled = config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
+        await query.edit_message_text(
+            f"✅ Settings saved!\n\n"
+            f"Confidence: ≥{min_conf}%\n"
+            f"Min Odds: ≥{min_odds}\n"
+            f"Markets: {', '.join(enabled)}\n\n"
+            "Run /pick to get selections."
+        )
         return ConversationHandler.END
 
-    chat_id = update.effective_chat.id
-    config = load_user_config(chat_id=chat_id)
-    config["strategy"] = preset_key
-    save_user_config(config, chat_id=chat_id)
+    # Legacy preset fallback
+    preset_key = data.replace("strat_", "")
+    if preset_key in STRATEGY_PRESETS:
+        preset = STRATEGY_PRESETS[preset_key]
+        config["min_confidence"] = preset["min_confidence"]
+        config["min_odds"] = preset.get("min_odds", 1.10)
+        config["enabled_markets"] = preset["preferred_markets"]
+        save_user_config(config, chat_id=chat_id)
+        await query.edit_message_text(
+            f"Settings applied from {preset['label']} preset.\n\n"
+            f"Confidence: ≥{preset['min_confidence']}%\n"
+            f"Min Odds: ≥{preset.get('min_odds', 1.10)}\n"
+            f"Markets: {', '.join(preset['preferred_markets'])}\n\n"
+            "Run /pick to get selections."
+        )
+        return ConversationHandler.END
 
-    await query.edit_message_text(
-        f"Strategy set to: {preset['label']}\n"
-        f"{preset['description']}\n\n"
-        f"Min confidence: {preset['min_confidence']}%\n"
-        f"Markets: {', '.join(preset['preferred_markets'])}\n"
-        f"Over threshold: {preset['over_threshold']}\n\n"
-        f"Run /pick to get selections."
-    )
-    return ConversationHandler.END
+    return STRAT_CUSTOM_CONFIDENCE
 
 
 async def callback_strat_custom_confidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle custom strategy confidence selection."""
-    query = update.callback_query
-    await query.answer()
-
-    conf = int(query.data.replace("strat_conf_", ""))
-    context.user_data["custom_strategy"]["min_confidence"] = conf
-
-    # Step 2: Market selection (toggleable)
-    context.user_data["custom_strategy"]["preferred_markets"] = ["1X2", "Over/Under", "GG/NG"]
-
-    all_markets = ["1X2", "Over/Under", "GG/NG"]
-    active = set(context.user_data["custom_strategy"]["preferred_markets"])
-
-    buttons = []
-    for m in all_markets:
-        check = "on" if m in active else "off"
-        buttons.append([InlineKeyboardButton(
-            f"{'✅' if m in active else '⬜'} {m}",
-            callback_data=f"strat_mkt_{check}_{m}",
-        )])
-    buttons.append([InlineKeyboardButton("Done", callback_data="strat_mkt_done")])
-
-    await query.edit_message_text(
-        f"Custom Strategy — Step 2/3\n"
-        f"Min confidence: {conf}%\n\n"
-        "Toggle markets to include:\n(Tap to toggle on/off)",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-    return STRAT_CUSTOM_MARKETS
-
-
-async def callback_strat_custom_markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle custom strategy market toggle."""
+    """Handle confidence selection."""
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    if data == "strat_mkt_done":
-        # Proceed to step 3: over threshold
-        custom = context.user_data.get("custom_strategy", {})
-        markets = custom.get("preferred_markets", [])
-        if not markets:
-            markets = ["1X2", "Over/Under", "GG/NG"]
-            custom["preferred_markets"] = markets
+    if data in ("strat_conf_menu", "strat_mkt_menu", "strat_odds_menu", "strat_back", "strat_done"):
+        return await callback_strategy_select(update, context)
 
-        buttons = [
-            [
-                InlineKeyboardButton("Over 0.5", callback_data="strat_over_0.5"),
-                InlineKeyboardButton("Over 1.5", callback_data="strat_over_1.5"),
-                InlineKeyboardButton("Over 2.5", callback_data="strat_over_2.5"),
-            ],
-        ]
-        await query.edit_message_text(
-            f"Custom Strategy — Step 3/3\n"
-            f"Min confidence: {custom['min_confidence']}%\n"
-            f"Markets: {', '.join(markets)}\n\n"
-            "Over threshold (minimum goal line for Over picks):",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-        return STRAT_CUSTOM_OVER
+    conf = int(data.replace("strat_conf_", ""))
+    chat_id = update.effective_chat.id
+    config = load_user_config(chat_id=chat_id)
+    config["min_confidence"] = conf
+    save_user_config(config, chat_id=chat_id)
 
-    # Toggle a market
-    # data format: strat_mkt_{on|off}_{market_name}
+    # Show updated main menu
+    min_odds = config.get("min_odds", 1.05)
+    enabled = config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
+    buttons = [
+        [InlineKeyboardButton(f"🎯 Confidence ({conf}%)", callback_data="strat_conf_menu")],
+        [InlineKeyboardButton(f"📊 Markets ({len(enabled)})", callback_data="strat_mkt_menu")],
+        [InlineKeyboardButton(f"💰 Min Odds ({min_odds})", callback_data="strat_odds_menu")],
+        [InlineKeyboardButton("✅ Done", callback_data="strat_done")],
+    ]
+    await query.edit_message_text(
+        f"✅ Confidence set to {conf}%\n\n"
+        f"⚙️ *Pick Settings*\n"
+        f"Confidence: ≥{conf}%\n"
+        f"Min Odds: ≥{min_odds}\n"
+        f"Markets: {', '.join(enabled)}",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+    return STRAT_CUSTOM_CONFIDENCE
+
+
+async def callback_strat_custom_markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle market toggle in settings."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data in ("strat_back", "strat_done"):
+        return await callback_strategy_select(update, context)
+
+    chat_id = update.effective_chat.id
+    config = load_user_config(chat_id=chat_id)
+    enabled = config.get("enabled_markets", list(DEFAULT_ENABLED_MARKETS))
+
+    # Parse toggle: strat_mkt_{on|off}_{market_name}
     parts = data.replace("strat_mkt_", "").split("_", 1)
-    current_state = parts[0]  # "on" or "off"
+    current_state = parts[0]
     market_name = parts[1]
 
-    custom = context.user_data.get("custom_strategy", {})
-    markets = custom.get("preferred_markets", ["1X2", "Over/Under", "GG/NG"])
+    if current_state == "on" and market_name in enabled:
+        enabled.remove(market_name)
+    elif current_state == "off" and market_name not in enabled:
+        enabled.append(market_name)
 
-    if current_state == "on" and market_name in markets:
-        markets.remove(market_name)
-    elif current_state == "off" and market_name not in markets:
-        markets.append(market_name)
+    # Ensure at least one market is enabled
+    if not enabled:
+        enabled = list(DEFAULT_ENABLED_MARKETS)
 
-    custom["preferred_markets"] = markets
-    context.user_data["custom_strategy"] = custom
+    config["enabled_markets"] = enabled
+    save_user_config(config, chat_id=chat_id)
 
     # Rebuild buttons
-    all_markets = ["1X2", "Over/Under", "GG/NG"]
-    active = set(markets)
     buttons = []
-    for m in all_markets:
-        check = "on" if m in active else "off"
+    active = set(enabled)
+    for mkt_name, mkt_info in AVAILABLE_MARKETS.items():
+        check = "✅" if mkt_name in active else "⬜"
+        state = "on" if mkt_name in active else "off"
         buttons.append([InlineKeyboardButton(
-            f"{'✅' if m in active else '⬜'} {m}",
-            callback_data=f"strat_mkt_{check}_{m}",
+            f"{check} {mkt_name} — {mkt_info['description']}",
+            callback_data=f"strat_mkt_{state}_{mkt_name}",
         )])
-    buttons.append([InlineKeyboardButton("Done", callback_data="strat_mkt_done")])
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="strat_back")])
 
     await query.edit_message_reply_markup(InlineKeyboardMarkup(buttons))
     return STRAT_CUSTOM_MARKETS
 
 
 async def callback_strat_custom_over(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle custom strategy over threshold selection — proceed to min odds."""
-    query = update.callback_query
-    await query.answer()
-
-    threshold = float(query.data.replace("strat_over_", ""))
-    custom = context.user_data.get("custom_strategy", {})
-    custom["over_threshold"] = threshold
-
-    buttons = [
-        [
-            InlineKeyboardButton("1.10", callback_data="strat_minodds_1.10"),
-            InlineKeyboardButton("1.20", callback_data="strat_minodds_1.20"),
-            InlineKeyboardButton("1.30", callback_data="strat_minodds_1.30"),
-        ],
-        [
-            InlineKeyboardButton("1.40", callback_data="strat_minodds_1.40"),
-            InlineKeyboardButton("1.60", callback_data="strat_minodds_1.60"),
-            InlineKeyboardButton("1.80", callback_data="strat_minodds_1.80"),
-        ],
-    ]
-    await query.edit_message_text(
-        f"Custom Strategy — Step 4/4\n"
-        f"Min confidence: {custom['min_confidence']}%\n"
-        f"Markets: {', '.join(custom['preferred_markets'])}\n"
-        f"Over threshold: {threshold}\n\n"
-        "Minimum odds per pick (filters out low-value picks):",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-    return STRAT_CUSTOM_MIN_ODDS
+    """Legacy — redirect to main settings."""
+    return await callback_strategy_select(update, context)
 
 
 async def callback_strat_custom_min_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle custom strategy min odds selection and save."""
+    """Handle min odds selection."""
     query = update.callback_query
     await query.answer()
+    data = query.data
 
-    min_odds = float(query.data.replace("strat_minodds_", ""))
-    custom = context.user_data.get("custom_strategy", {})
-    custom["min_odds"] = min_odds
-    custom["label"] = "Custom"
+    if data in ("strat_back", "strat_done"):
+        return await callback_strategy_select(update, context)
 
+    min_odds = float(data.replace("strat_minodds_", ""))
     chat_id = update.effective_chat.id
     config = load_user_config(chat_id=chat_id)
-    config["strategy"] = custom
+    config["min_odds"] = min_odds
     save_user_config(config, chat_id=chat_id)
 
+    # Show updated main menu
+    min_conf = config.get("min_confidence", 75)
+    enabled = config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
+    buttons = [
+        [InlineKeyboardButton(f"🎯 Confidence ({min_conf}%)", callback_data="strat_conf_menu")],
+        [InlineKeyboardButton(f"📊 Markets ({len(enabled)})", callback_data="strat_mkt_menu")],
+        [InlineKeyboardButton(f"💰 Min Odds ({min_odds})", callback_data="strat_odds_menu")],
+        [InlineKeyboardButton("✅ Done", callback_data="strat_done")],
+    ]
     await query.edit_message_text(
-        f"Custom strategy saved!\n\n"
-        f"Min confidence: {custom['min_confidence']}%\n"
-        f"Min odds/pick: {custom['min_odds']}\n"
-        f"Markets: {', '.join(custom['preferred_markets'])}\n"
-        f"Over threshold: {custom['over_threshold']}\n\n"
-        f"Run /pick to get selections."
+        f"✅ Min Odds set to {min_odds}\n\n"
+        f"⚙️ *Pick Settings*\n"
+        f"Confidence: ≥{min_conf}%\n"
+        f"Min Odds: ≥{min_odds}\n"
+        f"Markets: {', '.join(enabled)}",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
     )
-
-    context.user_data.pop("custom_strategy", None)
-    return ConversationHandler.END
+    return STRAT_CUSTOM_CONFIDENCE
 
 
 async def strategy_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel the strategy flow."""
+    """Cancel the settings flow."""
     context.user_data.pop("custom_strategy", None)
-    await update.message.reply_text("Strategy selection cancelled.")
+    await update.message.reply_text("Settings cancelled.")
     return ConversationHandler.END
 
 
@@ -2196,6 +2426,7 @@ async def callback_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the check flow. If codes given inline, skip to review."""
+    context.user_data["chat_id"] = update.effective_chat.id
     args = context.args or []
 
     if args:
@@ -2226,7 +2457,7 @@ async def check_receive_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, codes: list[str]):
-    """Fetch booking codes, analyze them, then ask user whether to expand with league picks."""
+    """Fetch booking codes, score them using scorer.py + real SportyBet odds, then ask to expand."""
     await update.message.reply_text(f"🔍 Fetching {len(codes)} code(s): {', '.join(codes)}...")
 
     all_picks = []
@@ -2249,41 +2480,289 @@ async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
         await update.message.reply_text("No valid picks found in any code.")
         return ConversationHandler.END
 
-    # Analyze booking code picks (deep analysis)
+    # ── Score booking code picks using the SAME pipeline as /pick ──
     code_pick_count = len(all_picks)
-    await update.message.reply_text(f"🔬 Deep-analyzing {code_pick_count} booking code game(s)...")
+    progress_msg = await update.message.reply_text(
+        f"🔬 Scoring {code_pick_count} game(s) with full analysis..."
+    )
 
-    analyzed_picks = []
+    all_scored = []
+    analyzed_count = 0
+
     for pick in all_picks:
+        if pick["match_status"] == "Ended":
+            # Already completed — keep as-is with original data
+            pick["_source"] = "booking_code"
+            pick["data_confidence"] = pick.get("confidence", 50)
+            pick["verdict"] = "won" if pick.get("is_winning") == 1 else "lost" if pick.get("is_winning") == 0 else "ended"
+            pick["analysis_reasons"] = [f"Match ended: {pick.get('score', '?')}"]
+            pick["suggestion"] = None
+            pick["data_quality"] = "ended"
+            all_scored.append(pick)
+            continue
+
+        home_name = pick.get("home", "")
+        away_name = pick.get("away", "")
+
         try:
-            analyzed = await asyncio.to_thread(web_analyze_pick, pick)
-            analyzed["_source"] = "booking_code"
-            analyzed_picks.append(analyzed)
+            # 1. Look up real SportyBet event for real odds
+            sporty_event = await asyncio.to_thread(find_event, home_name, away_name)
+
+            # 2. Fetch form data for scoring
+            home_results = await asyncio.to_thread(get_team_results, home_name, count=10)
+            away_results = await asyncio.to_thread(get_team_results, away_name, count=10)
+
+            home_form = _summarize_form(home_results) if home_results else None
+            away_form = _summarize_form(away_results) if away_results else None
+
+            event_id = pick.get("event_id", "")
+            if sporty_event:
+                event_id = sporty_event.get("eventId", event_id)
+            markets = sporty_event.get("markets", {}) if sporty_event else {}
+
+            base_pick = {
+                "home": home_name,
+                "away": away_name,
+                "league": pick.get("tournament", ""),
+                "date": "",
+                "match_status": pick.get("match_status", "Upcoming"),
+                "is_winning": pick.get("is_winning"),
+                "score": pick.get("score", ""),
+                "event_id": event_id,
+                "selection": pick.get("selection", {}),
+                "tournament": pick.get("tournament", ""),
+                "_source": "booking_code",
+                "_sporty_event": sporty_event,
+                "_original_pick": pick.get("pick", ""),
+                "_original_market": pick.get("market", ""),
+                "_original_odds": pick.get("odds", 1.0),
+            }
+
+            if home_form and away_form:
+                data_quality = "good"
+                scores = score_match(home_form, away_form, home_results, away_results)
+
+                def _get_odds_1x2(outcome_id: str) -> float:
+                    o = markets.get("1", {}).get("outcomes", {}).get(outcome_id, {})
+                    try:
+                        return float(o.get("odds", "0"))
+                    except (ValueError, TypeError):
+                        return 0.0
+
+                def _get_over_odds(threshold: float) -> float:
+                    mkt = markets.get(f"18|total={threshold}", {})
+                    o12 = mkt.get("outcomes", {}).get("12", {})
+                    try:
+                        return float(o12.get("odds", "0"))
+                    except (ValueError, TypeError):
+                        return 0.0
+
+                def _get_gg_odds() -> float:
+                    o = markets.get("29", {}).get("outcomes", {}).get("74", {})
+                    try:
+                        return float(o.get("odds", "0"))
+                    except (ValueError, TypeError):
+                        return 0.0
+
+                def _verdict(conf: int) -> str:
+                    if conf >= 75:
+                        return "strong"
+                    elif conf >= 60:
+                        return "moderate"
+                    return "weak"
+
+                # Score ALL markets for this match (same as /pick)
+                match_scored = []
+
+                # Home Win
+                hw = scores["home_win"]
+                real_home_odds = _get_odds_1x2("1")
+                if real_home_odds > 1.0:
+                    checked = cross_check_with_odds(hw["confidence"], real_home_odds)
+                    conf = checked["confidence"]
+                    reasons = hw["reasons"][:]
+                    if checked["warning"]:
+                        reasons.append(checked["warning"])
+                    if conf >= 45:
+                        match_scored.append({
+                            **base_pick,
+                            "market": "1X2", "pick": "Home",
+                            "odds": real_home_odds,
+                            "confidence": conf, "data_confidence": conf,
+                            "verdict": _verdict(conf),
+                            "analysis_reasons": reasons,
+                            "suggestion": None, "data_quality": data_quality,
+                            "rating": "safe" if conf >= 70 else "moderate",
+                        })
+
+                # Away Win
+                aw = scores["away_win"]
+                real_away_odds = _get_odds_1x2("3")
+                if real_away_odds > 1.0:
+                    checked = cross_check_with_odds(aw["confidence"], real_away_odds)
+                    conf = checked["confidence"]
+                    reasons = aw["reasons"][:]
+                    if checked["warning"]:
+                        reasons.append(checked["warning"])
+                    if conf >= 45:
+                        match_scored.append({
+                            **base_pick,
+                            "market": "1X2", "pick": "Away",
+                            "odds": real_away_odds,
+                            "confidence": conf, "data_confidence": conf,
+                            "verdict": _verdict(conf),
+                            "analysis_reasons": reasons,
+                            "suggestion": None, "data_quality": data_quality,
+                            "rating": "safe" if conf >= 70 else "moderate",
+                        })
+
+                # Over 0.5 / 1.5 / 2.5
+                for threshold, key in [(0.5, "over_0.5"), (1.5, "over_1.5"), (2.5, "over_2.5")]:
+                    ov = scores[key]
+                    real_odds = _get_over_odds(threshold)
+                    if real_odds > 1.0:
+                        checked = cross_check_with_odds(ov["confidence"], real_odds)
+                        conf = checked["confidence"]
+                        reasons = ov["reasons"][:]
+                        if checked["warning"]:
+                            reasons.append(checked["warning"])
+                        if conf >= 45:
+                            match_scored.append({
+                                **base_pick,
+                                "market": "Over/Under",
+                                "pick": f"Over (total={threshold})",
+                                "odds": real_odds,
+                                "confidence": conf, "data_confidence": conf,
+                                "verdict": _verdict(conf),
+                                "analysis_reasons": reasons,
+                                "suggestion": None, "data_quality": data_quality,
+                                "rating": "safe" if threshold <= 1.5 else "moderate",
+                            })
+
+                # BTTS
+                bt = scores["btts"]
+                gg_odds = _get_gg_odds()
+                if gg_odds > 1.0:
+                    checked = cross_check_with_odds(bt["confidence"], gg_odds)
+                    conf = checked["confidence"]
+                    reasons = bt["reasons"][:]
+                    if checked["warning"]:
+                        reasons.append(checked["warning"])
+                    if conf >= 45:
+                        match_scored.append({
+                            **base_pick,
+                            "market": "GG/NG", "pick": "GG",
+                            "odds": gg_odds,
+                            "confidence": conf, "data_confidence": conf,
+                            "verdict": _verdict(conf),
+                            "analysis_reasons": reasons,
+                            "suggestion": None, "data_quality": data_quality,
+                            "rating": "moderate",
+                        })
+
+                # Extended markets
+                _add_extended_picks(
+                    match_scored, scores, markets, base_pick,
+                    data_quality, _verdict,
+                )
+
+                all_scored.extend(match_scored)
+                analyzed_count += 1
+
+            else:
+                # No form data — keep original pick with odds-only confidence
+                pick["_source"] = "booking_code"
+                pick["data_confidence"] = pick.get("confidence", 50)
+                pick["verdict"] = _confidence_verdict(pick.get("confidence", 50))
+                pick["analysis_reasons"] = ["⚠ No form data — odds-only estimate"]
+                pick["suggestion"] = None
+                pick["data_quality"] = "limited"
+                pick["event_id"] = event_id
+                pick["_sporty_event"] = sporty_event
+                all_scored.append(pick)
+                analyzed_count += 1
+
         except Exception as e:
-            logger.warning(f"Analysis failed for {pick.get('home')} vs {pick.get('away')}: {e}")
+            logger.warning(f"Check analysis failed for {home_name} vs {away_name}: {e}")
+            pick["_source"] = "booking_code"
             pick["data_confidence"] = pick.get("confidence", 50)
             pick["verdict"] = "error"
             pick["analysis_reasons"] = [f"Analysis error: {str(e)[:50]}"]
             pick["suggestion"] = None
-            pick["_source"] = "booking_code"
-            analyzed_picks.append(pick)
+            pick["data_quality"] = "limited"
+            all_scored.append(pick)
 
-    # Store analyzed code picks and codes in context
-    context.user_data["check_picks"] = analyzed_picks
+    try:
+        await progress_msg.edit_text(
+            f"✅ Scored {analyzed_count} matches — {len(all_scored)} picks available."
+        )
+    except Exception:
+        pass
+
+    # Store scored picks (same format as /pick's all_scored)
+    context.user_data["check_all_scored"] = all_scored
     context.user_data["check_codes"] = valid_codes
+    context.user_data["check_excluded"] = set()
 
-    # Send deep review of booking code games
-    review = format_deep_review(analyzed_picks, valid_codes)
-    await send_long_message(update, review)
+    # Show summary of code game verdicts
+    pending = [p for p in all_scored if p.get("verdict") not in ("won", "lost", "ended")]
+    ended = [p for p in all_scored if p.get("verdict") in ("won", "lost", "ended")]
+
+    verdict_icons = {"strong": "🟢", "moderate": "🟡", "weak": "🟠", "avoid": "🔴", "won": "✅", "lost": "❌"}
+    lines = [f"📊 Analysis — {len(all_picks)} games from {len(valid_codes)} code(s)\n"]
+
+    if ended:
+        won = sum(1 for p in ended if p.get("is_winning") == 1)
+        lost = sum(1 for p in ended if p.get("is_winning") == 0)
+        lines.append(f"Completed: {won} won, {lost} lost\n")
+
+    # Show the ORIGINAL picks from the booking code with their new scores
+    original_matches = set()
+    for pick in all_picks:
+        if pick["match_status"] == "Ended":
+            continue
+        mk = f"{pick['home']}_{pick['away']}"
+        if mk in original_matches:
+            continue
+        original_matches.add(mk)
+
+        # Find the scored version of the original pick's market
+        orig_market = pick.get("market", "").lower()
+        orig_pick = pick.get("pick", "").lower()
+        best_match = None
+        for sp in all_scored:
+            if sp.get("home") == pick["home"] and sp.get("away") == pick["away"]:
+                sp_market = sp.get("market", "").lower()
+                sp_pick = sp.get("pick", "").lower()
+                # Try matching the original market
+                if orig_market in sp_market or sp_market in orig_market:
+                    if not best_match or sp.get("confidence", 0) > best_match.get("confidence", 0):
+                        best_match = sp
+        if not best_match:
+            # Just take the highest confidence pick for this match
+            for sp in all_scored:
+                if sp.get("home") == pick["home"] and sp.get("away") == pick["away"]:
+                    if not best_match or sp.get("confidence", 0) > best_match.get("confidence", 0):
+                        best_match = sp
+        if best_match:
+            icon = verdict_icons.get(best_match.get("verdict", ""), "❓")
+            conf = best_match.get("confidence", "?")
+            lines.append(
+                f"{icon} {pick['home']} vs {pick['away']}\n"
+                f"   Code: {pick['market']}: {pick['pick']} @ {pick['odds']:.2f}\n"
+                f"   Score: {best_match['market']}: {best_match['pick']} [{conf}%]"
+            )
+            reasons = best_match.get("analysis_reasons", [])
+            if reasons:
+                lines.append(f"   > {reasons[0]}")
+            lines.append("")
+
+    await send_long_message(update, "\n".join(lines))
 
     # Ask user: expand with league picks or proceed with code games only?
     expand_buttons = [
-        [
-            InlineKeyboardButton("✅ Add more picks from SportyBet", callback_data="check_expand_yes"),
-        ],
-        [
-            InlineKeyboardButton("🎯 Code games only", callback_data="check_expand_no"),
-        ],
+        [InlineKeyboardButton("✅ Add more picks from SportyBet", callback_data="check_expand_yes")],
+        [InlineKeyboardButton("🎯 Code games only", callback_data="check_expand_no")],
     ]
     await update.message.reply_text(
         "Want to add extra picks from your SportyBet leagues, or proceed with just the code games?",
@@ -2294,154 +2773,192 @@ async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
 
 
 async def check_expand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle expand choice: add SportyBet league picks or proceed with code games only."""
+    """Handle expand choice: add SportyBet league picks (scored via /pick's pipeline) or code only."""
     query = update.callback_query
     await query.answer()
 
     data = query.data
+    all_scored = context.user_data.get("check_all_scored", [])
 
     if data == "check_expand_no":
-        # Code games only — go straight to target odds
-        await query.edit_message_text("🎯 Proceeding with code games only.")
-        return await _show_target_odds_buttons(query.message, context, edit=False)
+        await query.edit_message_text("🎯 Got it — working with your code games.")
+        return await _show_check_target_odds(query.message, context, edit=False)
 
-    # data == "check_expand_yes" — scan leagues and merge
-    analyzed_picks = context.user_data.get("check_picks", [])
-
-    # Track matches already in booking codes to avoid duplicates
-    code_matches = set()
-    for p in analyzed_picks:
-        code_matches.add(f"{p['home'].lower()}_{p['away'].lower()}")
-
+    # data == "check_expand_yes" — scan SportyBet events for user's leagues
+    # Uses the SAME scoring as /pick (SportyBet events + scorer.py)
     config = load_user_config(chat_id=update.effective_chat.id)
     leagues = config.get("leagues", [])
-    days_ahead = config.get("days_ahead", 14)
-    today = datetime.now()
-    date_from = today.strftime("%Y-%m-%d")
-    date_to = (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+    timeframe = config.get("timeframe", "7days")
 
-    league_picks = []
-    if leagues:
-        await query.edit_message_text(
-            f"📊 Scanning {len(leagues)} league(s) for extra picks to strengthen the pool..."
-        )
-        for lid in leagues:
+    if not leagues:
+        await query.edit_message_text("No leagues set up yet — use /leagues to add some.\nWorking with your code games for now.")
+        return await _show_check_target_odds(query.message, context, edit=False)
+
+    await query.edit_message_text(
+        f"📊 Scanning {len(leagues)} league(s) on SportyBet + analyzing form..."
+    )
+
+    # Track existing matches to avoid duplicates
+    code_matches = set()
+    for p in all_scored:
+        code_matches.add(f"{p.get('home', '').lower()}_{p.get('away', '').lower()}")
+
+    # Fetch SportyBet events for user's leagues
+    from config import LEAGUE_SPORTYBET_NAMES
+    tournament_filters = []
+    for lid in leagues:
+        tournament_filters.extend(LEAGUE_SPORTYBET_NAMES.get(lid, []))
+
+    events = await asyncio.to_thread(fetch_all_events, max_pages=5, allowed_tournaments=tournament_filters)
+    events = filter_events(events, league_ids=leagues, timeframe=timeframe)
+
+    league_scored = []
+    scanned = 0
+    for ev in events:
+        home_name = ev.get("home", "")
+        away_name = ev.get("away", "")
+        match_key = f"{home_name.lower()}_{away_name.lower()}"
+        if match_key in code_matches:
+            continue
+
+        try:
+            home_results = await asyncio.to_thread(get_team_results, home_name, count=10)
+            away_results = await asyncio.to_thread(get_team_results, away_name, count=10)
+            if not home_results or not away_results:
+                continue
+
+            home_form = _summarize_form(home_results)
+            away_form = _summarize_form(away_results)
+
+            event_id = ev.get("eventId", "")
+            tournament = ev.get("tournament", "")
+            markets = ev.get("markets", {})
+            kick_off = ev.get("estimateStartTime", 0)
             try:
-                fixtures = await asyncio.to_thread(get_fixtures_lookahead, lid, date_from=date_from, date_to=date_to)
-                for f in fixtures:
-                    home_name = f["home"]["name"]
-                    away_name = f["away"]["name"]
-                    match_key = f"{home_name.lower()}_{away_name.lower()}"
+                match_date = datetime.fromtimestamp(kick_off / 1000).strftime("%Y-%m-%d %H:%M") if kick_off else ""
+            except Exception:
+                match_date = ""
 
-                    if match_key in code_matches:
-                        continue  # already in booking code
+            base_pick = {
+                "home": home_name, "away": away_name,
+                "league": tournament, "date": match_date,
+                "match_status": "Upcoming", "is_winning": None,
+                "score": "", "event_id": event_id,
+                "selection": {}, "tournament": tournament,
+                "_source": "league_scan", "_sporty_event": ev,
+            }
 
-                    # Score this fixture quickly
-                    try:
-                        home_results = await asyncio.to_thread(get_team_results, home_name, count=10)
-                        away_results = await asyncio.to_thread(get_team_results, away_name, count=10)
+            scores = score_match(home_form, away_form, home_results, away_results)
+            real_1x2 = markets.get("1", {})
+            real_gg = markets.get("29", {})
 
-                        if not home_results or not away_results:
-                            continue
+            def _get_odds_1x2(oid):
+                o = real_1x2.get("outcomes", {}).get(oid, {})
+                try: return float(o.get("odds", "0"))
+                except: return 0.0
 
-                        home_form = _summarize_form(home_results)
-                        away_form = _summarize_form(away_results)
+            def _get_over_odds(threshold):
+                mkt = markets.get(f"18|total={threshold}", {})
+                o = mkt.get("outcomes", {}).get("12", {})
+                try: return float(o.get("odds", "0"))
+                except: return 0.0
 
-                        # Home Win option
-                        home_wr = home_form["wins"] / max(home_form["played"], 1)
-                        away_lr = away_form["losses"] / max(away_form["played"], 1)
-                        win_conf = int((home_wr * 45 + away_lr * 25 + 30) * 1.0)
-                        win_conf = max(0, min(100, win_conf))
+            def _get_gg_odds():
+                o = real_gg.get("outcomes", {}).get("74", {})
+                try: return float(o.get("odds", "0"))
+                except: return 0.0
 
-                        if win_conf >= 65:
-                            win_odds = 1.20 if win_conf >= 85 else 1.35 if win_conf >= 75 else 1.55
-                            league_picks.append({
-                                "home": home_name,
-                                "away": away_name,
-                                "tournament": f["league"]["name"],
-                                "market": "1X2",
-                                "pick": "Home",
-                                "odds": win_odds,
-                                "confidence": win_conf,
-                                "match_status": "Upcoming",
-                                "is_winning": None,
-                                "score": "",
-                                "rating": "moderate" if win_conf < 75 else "safe",
-                                "event_id": "",
-                                "selection": {},
-                                "_source": "league_scan",
-                            })
+            def _verdict(conf):
+                return "strong" if conf >= 75 else "moderate" if conf >= 60 else "weak"
 
-                        # Over 1.5 option
-                        expected_goals = (
-                            (home_form["avg_scored"] + away_form["avg_conceded"]) / 2 +
-                            (away_form["avg_scored"] + home_form["avg_conceded"]) / 2
-                        )
-                        over_prob = _poisson_over_prob(expected_goals, 1.5)
-                        over_conf = max(0, min(100, int(over_prob * 100)))
+            # Score all markets (same as /pick)
+            for mkt_key, scorer_key, market_label, pick_label, odds_fn in [
+                ("hw", "home_win", "1X2", "Home", lambda: _get_odds_1x2("1")),
+                ("aw", "away_win", "1X2", "Away", lambda: _get_odds_1x2("3")),
+            ]:
+                sc = scores[scorer_key]
+                real_odds = odds_fn()
+                if real_odds > 1.0:
+                    checked = cross_check_with_odds(sc["confidence"], real_odds)
+                    conf = checked["confidence"]
+                    reasons = sc["reasons"][:]
+                    if checked["warning"]:
+                        reasons.append(checked["warning"])
+                    if conf >= 45:
+                        league_scored.append({
+                            **base_pick, "market": market_label, "pick": pick_label,
+                            "odds": real_odds, "confidence": conf, "data_confidence": conf,
+                            "verdict": _verdict(conf), "analysis_reasons": reasons,
+                            "suggestion": None, "data_quality": "good",
+                            "rating": "safe" if conf >= 70 else "moderate",
+                        })
 
-                        if over_conf >= 70:
-                            league_picks.append({
-                                "home": home_name,
-                                "away": away_name,
-                                "tournament": f["league"]["name"],
-                                "market": "Over/Under",
-                                "pick": f"Over (total=1.5)",
-                                "odds": 1.28,
-                                "confidence": over_conf,
-                                "match_status": "Upcoming",
-                                "is_winning": None,
-                                "score": "",
-                                "rating": "safe",
-                                "event_id": "",
-                                "selection": {},
-                                "_source": "league_scan",
-                            })
+            for threshold, key in [(0.5, "over_0.5"), (1.5, "over_1.5"), (2.5, "over_2.5")]:
+                ov = scores[key]
+                real_odds = _get_over_odds(threshold)
+                if real_odds > 1.0:
+                    checked = cross_check_with_odds(ov["confidence"], real_odds)
+                    conf = checked["confidence"]
+                    reasons = ov["reasons"][:]
+                    if checked["warning"]:
+                        reasons.append(checked["warning"])
+                    if conf >= 45:
+                        league_scored.append({
+                            **base_pick, "market": "Over/Under",
+                            "pick": f"Over (total={threshold})",
+                            "odds": real_odds, "confidence": conf, "data_confidence": conf,
+                            "verdict": _verdict(conf), "analysis_reasons": reasons,
+                            "suggestion": None, "data_quality": "good",
+                            "rating": "safe" if threshold <= 1.5 else "moderate",
+                        })
 
-                        code_matches.add(match_key)  # prevent duplicate per match
+            bt = scores["btts"]
+            gg_odds = _get_gg_odds()
+            if gg_odds > 1.0:
+                checked = cross_check_with_odds(bt["confidence"], gg_odds)
+                conf = checked["confidence"]
+                reasons = bt["reasons"][:]
+                if checked["warning"]:
+                    reasons.append(checked["warning"])
+                if conf >= 45:
+                    league_scored.append({
+                        **base_pick, "market": "GG/NG", "pick": "GG",
+                        "odds": gg_odds, "confidence": conf, "data_confidence": conf,
+                        "verdict": _verdict(conf), "analysis_reasons": reasons,
+                        "suggestion": None, "data_quality": "good", "rating": "moderate",
+                    })
 
-                    except Exception as e:
-                        logger.warning(f"Error scoring {home_name} vs {away_name}: {e}")
-            except Exception as e:
-                logger.warning(f"Error fetching league {lid}: {e}")
-    else:
-        await query.edit_message_text("No leagues configured. Use /leagues to add some.\nProceeding with code games only.")
+            # Extended markets
+            _add_extended_picks(
+                league_scored, scores, markets, base_pick,
+                "good", _verdict,
+            )
 
-    # Analyze league picks and merge into the pool
-    if league_picks:
-        for pick in league_picks:
-            try:
-                analyzed = await asyncio.to_thread(web_analyze_pick, pick)
-                analyzed["_source"] = "league_scan"
-                analyzed_picks.append(analyzed)
-            except Exception as e:
-                pick["data_confidence"] = pick.get("confidence", 50)
-                pick["verdict"] = _confidence_verdict(pick.get("confidence", 50))
-                pick["analysis_reasons"] = ["From league scan"]
-                pick["suggestion"] = None
-                pick["data_quality"] = "fair"
-                pick["_source"] = "league_scan"
-                analyzed_picks.append(pick)
+            code_matches.add(match_key)
+            scanned += 1
 
-        context.user_data["check_picks"] = analyzed_picks
+        except Exception as e:
+            logger.warning(f"Check expand error for {home_name} vs {away_name}: {e}")
 
-        code_count = len([p for p in analyzed_picks if p.get("_source") == "booking_code"])
-        league_count = len([p for p in analyzed_picks if p.get("_source") == "league_scan"])
+    if league_scored:
+        all_scored.extend(league_scored)
+        context.user_data["check_all_scored"] = all_scored
+        code_count = len([p for p in all_scored if p.get("_source") == "booking_code"])
+        league_count = len([p for p in all_scored if p.get("_source") == "league_scan"])
         await query.message.reply_text(
-            f"📋 Pool expanded: {code_count} from codes + {league_count} from league scan"
+            f"📋 Pool expanded: {code_count} from codes + {league_count} from leagues ({scanned} matches scanned)"
         )
     else:
-        if leagues:
-            await query.message.reply_text("No qualifying league picks found. Proceeding with code games only.")
+        await query.message.reply_text("Nothing strong enough from the league scan — sticking with your code games.")
 
-    return await _show_target_odds_buttons(query.message, context, edit=False)
+    return await _show_check_target_odds(query.message, context, edit=False)
 
 
-async def _show_target_odds_buttons(message, context, edit=False):
-    """Display target odds selection buttons."""
-    picks = context.user_data.get("check_picks", [])
-    has_league = any(p.get("_source") == "league_scan" for p in picks)
-    source_note = "The best picks from BOTH sources will be combined:" if has_league else "Pick your target odds:"
+async def _show_check_target_odds(message, context, edit=False):
+    """Display target odds selection buttons for /check."""
+    all_scored = context.user_data.get("check_all_scored", [])
+    has_league = any(p.get("_source") == "league_scan" for p in all_scored)
+    source_note = "Best picks from BOTH sources will be combined:" if has_league else "Pick your target odds:"
 
     buttons = [
         [
@@ -2473,7 +2990,8 @@ async def check_receive_odds_text(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Send a number (e.g. 10) or /cancel.")
         return CHECK_TARGET_ODDS
 
-    return await _build_and_send_combo(update, context, target)
+    context.user_data["check_target"] = target
+    return await _check_build_and_show(update.message, context)
 
 
 async def check_receive_odds_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2483,251 +3001,190 @@ async def check_receive_odds_button(update: Update, context: ContextTypes.DEFAUL
 
     data = query.data.replace("check_odds_", "")
 
-    picks = context.user_data.get("check_picks", [])
+    all_scored = context.user_data.get("check_all_scored", [])
 
     if data == "all":
-        pending = [p for p in picks if p["match_status"] != "Ended"]
+        pending = [p for p in all_scored if p.get("match_status") != "Ended"]
         total = 1.0
         for p in pending:
-            total *= p["odds"]
+            total *= p.get("odds", 1.0)
         target = total
     else:
         target = float(data)
 
     context.user_data["check_target"] = target
-    return await _build_and_show_combo(query.message, context, target, edit=True)
+    return await _check_build_and_show(query.message, context)
 
 
-async def _build_and_send_combo(update: Update, context: ContextTypes.DEFAULT_TYPE, target: float):
-    """Build combo from stored picks and send result."""
-    picks = context.user_data.get("check_picks", [])
+async def _check_build_and_show(message, context):
+    """Build combo using /pick's pipeline, then show with full review UI."""
+    # Reuse _pick_build_combo by temporarily setting pick context
+    all_scored = context.user_data.get("check_all_scored", [])
+    target = context.user_data.get("check_target", 10)
+    excluded = context.user_data.get("check_excluded", set())
 
-    if not picks:
-        await update.message.reply_text("No picks stored. Start over with /check.")
+    if not all_scored:
+        await message.reply_text("No picks available. Start over with /check.")
         return ConversationHandler.END
 
-    context.user_data["check_target"] = target
-    return await _build_and_show_combo(update.message, context, target, edit=False)
+    # Save to pick context keys so _pick_build_combo works
+    context.user_data["pick_all_scored"] = all_scored
+    context.user_data["pick_excluded"] = excluded
+    context.user_data["pick_target"] = target
+    context.user_data["pick_shuffle_seed"] = context.user_data.get("check_shuffle_seed", 0)
+    context.user_data["_check_mode"] = True  # Flag to route back to check flow
+
+    result = await _pick_build_combo(message, context)
+
+    # Copy combo back to check context
+    context.user_data["check_combo"] = context.user_data.get("pick_combo", [])
+
+    return CHECK_REVIEW
 
 
-async def _build_and_show_combo(message, context, target, edit=False):
-    """Build combo, show it, then ask to exclude or confirm."""
-    picks = context.user_data.get("check_picks", [])
-
-    combo = build_best_combo(picks, target)
-    context.user_data["check_combo"] = combo
-
-    msg = format_combo_result(combo, target)
-
-    selected = combo.get("selected", [])
-    if not selected:
-        if edit:
-            await message.edit_text(msg)
-        else:
-            await message.reply_text(msg)
-        return ConversationHandler.END
-
-    # Add exclude + swap buttons — one row per selected pick
-    buttons = []
-    row = []
-    for i, p in enumerate(selected):
-        short = f"{p['home'][:8]} vs {p['away'][:8]}"
-        row.append(InlineKeyboardButton(f"❌ {i+1}. {short}", callback_data=f"exclude_{i}"))
-        if p.get("suggestion"):
-            row.append(InlineKeyboardButton(f"💡 Swap", callback_data=f"check_swap_{i}"))
-        if len(row) >= 3:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-
-    buttons.append([
-        InlineKeyboardButton("✅ Looks good — keep all", callback_data="check_confirm"),
-    ])
-
-    msg += "\n\nExclude any games? Tap to remove, or confirm:"
-
-    if edit:
-        await message.edit_text(msg, reply_markup=InlineKeyboardMarkup(buttons))
-    else:
-        await message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons))
-
-    return CHECK_EXCLUDE
-
-
-async def check_exclude_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle exclude button — remove a pick and rebuild combo."""
+async def check_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /check review buttons — unified with /pick's UI."""
     query = update.callback_query
     await query.answer()
-
     data = query.data
 
-    if data == "check_confirm":
-        # User is happy — try to book on SportyBet
-        combo = context.user_data.get("check_combo", {})
-        selected = combo.get("selected", [])
-        target = context.user_data.get("check_target", 10)
+    if data == "pick_explain_all":
+        combo = context.user_data.get("pick_combo", [])
+        if combo:
+            await _explain_picks(query.message, context, combo, [])
+        return CHECK_REVIEW
 
-        if not selected:
-            await query.edit_message_text("No picks left. Start over with /check.")
+    # Route confirm to check's booking flow
+    if data == "pick_confirm":
+        combo = context.user_data.get("pick_combo", [])
+        if not combo:
+            await query.edit_message_text("No picks. Start over with /check.")
             return ConversationHandler.END
 
-        # Final summary
+        # Book ALL picks (code + league) using /pick's booking logic
         total_odds = 1.0
         lines = ["✅ Final Selection:\n"]
-        for i, p in enumerate(selected, 1):
+        for i, p in enumerate(combo, 1):
             source_tag = " 📌" if p.get("_source") == "booking_code" else " 🔍"
+            market_label = p["pick"].replace("(total=", "").replace(")", "") if "total=" in p.get("pick", "") else p.get("pick", "")
             lines.append(f"{i}. {p['home']} vs {p['away']}{source_tag}")
-            lines.append(f"   {p['market']}: {p['pick']} @ {p['odds']:.2f}")
+            lines.append(f"   {p['market']}: {market_label} @ {p['odds']:.2f}")
             total_odds *= p["odds"]
-
         lines.append(f"\nTotal Odds: {total_odds:.2f}")
-        lines.append(f"Selections: {len(selected)}")
-
-        # Try to auto-book picks that have SportyBet event IDs
-        bookable = [p for p in selected if p.get("event_id") and p.get("selection")]
-        non_bookable = [p for p in selected if not p.get("event_id") or not p.get("selection")]
-
-        if bookable:
-            import requests as req
-            try:
-                selections = []
-                for p in bookable:
-                    sel = p.get("selection", {})
-                    if isinstance(sel, dict) and sel.get("eventId"):
-                        selections.append({
-                            "eventId": sel.get("eventId", p.get("event_id", "")),
-                            "marketId": str(sel.get("marketId", "1")),
-                            "outcomeId": str(sel.get("outcomeId", "1")),
-                            "specifier": sel.get("specifier", ""),
-                        })
-                    elif p.get("event_id"):
-                        # Build from pick data
-                        market_id = "1"  # 1X2
-                        outcome_id = "1"  # Home
-                        specifier = ""
-
-                        pick_lower = p.get("pick", "").lower()
-                        market_lower = p.get("market", "").lower()
-
-                        if "over" in pick_lower or "under" in pick_lower:
-                            market_id = "18"
-                            outcome_id = "12" if "over" in pick_lower else "13"
-                            if "total=" in pick_lower:
-                                specifier = pick_lower.split("(")[1].rstrip(")") if "(" in pick_lower else ""
-                        elif "gg" in pick_lower or "gg" in market_lower:
-                            market_id = "29"
-                            outcome_id = "74"  # GG
-                        elif "away" in pick_lower or pick_lower == "2":
-                            outcome_id = "3"
-                        elif "draw" in pick_lower or pick_lower == "x":
-                            outcome_id = "2"
-
-                        selections.append({
-                            "eventId": p["event_id"],
-                            "marketId": market_id,
-                            "outcomeId": outcome_id,
-                            "specifier": specifier,
-                        })
-
-                if selections:
-                    def _post_booking_code():
-                        return req.post(
-                            "https://www.sportybet.com/api/ng/orders/share",
-                            headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
-                            json={"selections": selections},
-                            timeout=15,
-                        )
-                    r = await asyncio.to_thread(_post_booking_code)
-                    resp = r.json()
-                    if resp.get("bizCode") == 10000 and resp.get("data", {}).get("shareCode"):
-                        code = resp["data"]["shareCode"]
-                        lines.append(f"\n🎫 Booking Code: {code}")
-                        lines.append(f"Tap to copy → SportyBet App → Betslip → Load Code")
-                    else:
-                        lines.append(f"\n⚠️ Auto-booking failed: {resp.get('message', 'unknown error')}")
-                        lines.append("You can manually add these on SportyBet.")
-            except Exception as e:
-                lines.append(f"\n⚠️ Booking error: {str(e)[:50]}")
-                lines.append("You can manually add these on SportyBet.")
-
-        if non_bookable:
-            lines.append(f"\n📋 {len(non_bookable)} pick(s) from league scan — find these manually on SportyBet.")
+        lines.append(f"Selections: {len(combo)}")
 
         await query.edit_message_text("\n".join(lines))
 
-        # Clean up
-        context.user_data.pop("check_picks", None)
-        context.user_data.pop("check_codes", None)
-        context.user_data.pop("check_combo", None)
-        context.user_data.pop("check_target", None)
+        # Use /pick's booking function — it handles ALL games with event_id
+        result = await _pick_confirm_and_book(query.message, context)
+
+        # Clean up check-specific context
+        for key in ["check_all_scored", "check_codes", "check_combo", "check_target",
+                     "check_excluded", "check_shuffle_seed", "_check_mode"]:
+            context.user_data.pop(key, None)
+
+        return result
+
+    if data == "pick_reshuffle":
+        seed = context.user_data.get("check_shuffle_seed", 0) + 1
+        context.user_data["check_shuffle_seed"] = seed
+        context.user_data["pick_shuffle_seed"] = seed
+        await query.edit_message_text(f"🔄 Reshuffling (seed {seed})...")
+        return await _check_build_and_show(query.message, context)
+
+    if data.startswith("pick_exclude_"):
+        idx = int(data.replace("pick_exclude_", ""))
+        combo = context.user_data.get("pick_combo", [])
+        if 0 <= idx < len(combo):
+            removed = combo[idx]
+            context.user_data.setdefault("check_excluded", set()).add(_pick_key(removed))
+            context.user_data["pick_excluded"] = context.user_data["check_excluded"]
+            await query.edit_message_text(f"❌ Excluded: {removed['home']} vs {removed['away']} ({removed.get('pick', '')})\nRebuilding...")
+        return await _check_build_and_show(query.message, context)
+
+    if data.startswith("pick_change_") or data.startswith("pick_mkt_") or data.startswith("pick_swap_"):
+        # Delegate to pick's review handler, then route back to check
+        result = await pick_review_callback(update, context)
+        # The pick handler returns PICK_REVIEW, but we need CHECK_REVIEW
+        return CHECK_REVIEW
+
+    return CHECK_REVIEW
+
+
+async def check_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle natural language during CHECK_REVIEW — uses same semantic layer as /pick."""
+    text = update.message.text.strip()
+    combo = context.user_data.get("pick_combo", [])
+    if not combo:
+        await update.message.reply_text("No active combo. Use /check to start.")
         return ConversationHandler.END
 
-    # Swap a pick's market to its suggestion
-    if data.startswith("check_swap_"):
-        idx = int(data.replace("check_swap_", ""))
-        combo = context.user_data.get("check_combo", {})
-        selected = combo.get("selected", [])
-        if 0 <= idx < len(selected):
-            pick = selected[idx]
-            suggestion = pick.get("suggestion")
-            if suggestion:
-                old_desc = f"{pick['market']}: {pick['pick']}"
-                pick["market"] = suggestion["market"]
-                pick["pick"] = suggestion["market"]
-                pick["confidence"] = suggestion["confidence"]
-                if "data_confidence" in pick:
-                    pick["data_confidence"] = suggestion["confidence"]
-                pick["verdict"] = _confidence_verdict(suggestion["confidence"])
-                pick["suggestion"] = None
-                if pick["odds"] > 1.5:
-                    pick["odds"] = max(1.10, pick["odds"] * 0.75)
-                # Also update in the main picks pool
-                picks = context.user_data.get("check_picks", [])
-                for pp in picks:
-                    if pp["home"] == pick["home"] and pp["away"] == pick["away"]:
-                        pp["market"] = pick["market"]
-                        pp["pick"] = pick["pick"]
-                        pp["confidence"] = pick["confidence"]
-                        pp["odds"] = pick["odds"]
-                        pp["suggestion"] = None
-                        break
-                await query.edit_message_text(
-                    f"💡 Swapped #{idx+1}: {old_desc}\n"
-                    f"   → {pick['market']} @ ~{pick['odds']:.2f}\nRebuilding..."
-                )
-            else:
-                await query.edit_message_text("No suggestion available.\nRebuilding...")
-        target = context.user_data.get("check_target", 10)
-        return await _build_and_show_combo(query.message, context, target, edit=True)
+    # Route through semantic layer
+    result = await asyncio.to_thread(
+        gemini_chat.parse_review_message, text, len(combo)
+    )
 
-    # Exclude a pick
-    idx = int(data.replace("exclude_", ""))
-    combo = context.user_data.get("check_combo", {})
-    selected = combo.get("selected", [])
+    intent = result.get("intent", "chat")
+    params = result.get("params", {})
+    reply = result.get("reply", "")
 
-    removed = None
-    if 0 <= idx < len(selected):
-        removed = selected.pop(idx)
-        logger.info(f"Excluded: {removed['home']} vs {removed['away']}")
+    # ── Book ──
+    if intent == "book":
+        if reply:
+            await update.message.reply_text(reply)
+        booking_result = await _pick_confirm_and_book(update.message, context)
+        for key in ["check_all_scored", "check_codes", "check_combo", "check_target",
+                     "check_excluded", "check_shuffle_seed", "_check_mode"]:
+            context.user_data.pop(key, None)
+        return booking_result
+
+    # ── Reshuffle ──
+    if intent == "reshuffle":
+        seed = context.user_data.get("check_shuffle_seed", 0) + 1
+        context.user_data["check_shuffle_seed"] = seed
+        context.user_data["pick_shuffle_seed"] = seed
+        await update.message.reply_text(reply or "🔄 Mixing it up...")
+        return await _check_build_and_show(update.message, context)
+
+    # ── Explain ──
+    if intent == "explain":
+        pick_nums = params.get("picks", [])
+        return await _explain_picks(update.message, context, combo, pick_nums)
+
+    # ── Edit ──
+    if intent == "edit":
+        actions = params.get("actions")
+        if not actions:
+            actions = await _parse_combo_edit(text, len(combo))
+
+        if not actions:
+            await update.message.reply_text(
+                reply or "Not sure what to change. Try:\n"
+                "• \"drop 1 and 3\"\n"
+                "• \"make 2 an over 1.5\"\n"
+                "• \"switch 4 to home win\""
+            )
+            return CHECK_REVIEW
+
+        return await _apply_combo_edits(update.message, context, combo, actions)
+
+    # ── Chat ──
+    if reply:
+        await update.message.reply_text(reply)
     else:
-        logger.warning(f"Exclude index {idx} out of range (selected has {len(selected)} items)")
-
-    # Also remove from the main picks pool so it doesn't get re-added
-    if removed is not None:
-        picks = context.user_data.get("check_picks", [])
-        picks = [p for p in picks if not (p["home"] == removed["home"] and p["away"] == removed["away"])]
-        context.user_data["check_picks"] = picks
-
-    # Rebuild combo with remaining picks
-    target = context.user_data.get("check_target", 10)
-    return await _build_and_show_combo(query.message, context, target, edit=True)
+        await update.message.reply_text(
+            "Still here! You can edit picks, ask me to explain them, "
+            "reshuffle, or confirm to book."
+        )
+    return CHECK_REVIEW
 
 
 async def check_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the check flow."""
-    context.user_data.pop("check_picks", None)
-    context.user_data.pop("check_codes", None)
+    for key in ["check_all_scored", "check_codes", "check_combo", "check_target",
+                 "check_excluded", "check_shuffle_seed", "_check_mode",
+                 "check_picks"]:
+        context.user_data.pop(key, None)
     await update.message.reply_text("Check cancelled.")
     return ConversationHandler.END
 
@@ -2743,7 +3200,8 @@ async def post_init(application: Application):
         BotCommand("leagues", "Select leagues to analyze"),
         BotCommand("timeframe", "Set scan window (1-14 days)"),
         BotCommand("refresh", "Fetch fresh fixture data"),
-        BotCommand("strategy", "Set betting strategy (conservative/balanced/aggressive/custom)"),
+        BotCommand("strategy", "Pick settings (confidence, markets, odds)"),
+        BotCommand("settings", "Pick settings (alias for /strategy)"),
         BotCommand("budget", "Check API calls remaining"),
         BotCommand("status", "Current bot config"),
     ]
@@ -2911,8 +3369,9 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, check_receive_odds_text),
                 CallbackQueryHandler(check_receive_odds_button, pattern=r"^check_odds_"),
             ],
-            CHECK_EXCLUDE: [
-                CallbackQueryHandler(check_exclude_callback, pattern=r"^(exclude_\d+|check_swap_\d+|check_confirm)$"),
+            CHECK_REVIEW: [
+                CallbackQueryHandler(check_review_callback, pattern=r"^(pick_exclude_\d+|pick_swap_\d+|pick_change_\d+|pick_mkt_.+|pick_reshuffle|pick_confirm|pick_explain_all)$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, check_edit_text),
             ],
         },
         fallbacks=[CommandHandler("cancel", check_cancel)],
@@ -2932,7 +3391,7 @@ def main():
                 CallbackQueryHandler(pick_receive_odds_button, pattern=r"^pick_target_"),
             ],
             PICK_REVIEW: [
-                CallbackQueryHandler(pick_review_callback, pattern=r"^(pick_exclude_\d+|pick_swap_\d+|pick_change_\d+|pick_mkt_.+|pick_reshuffle|pick_confirm)$"),
+                CallbackQueryHandler(pick_review_callback, pattern=r"^(pick_exclude_\d+|pick_swap_\d+|pick_change_\d+|pick_mkt_.+|pick_reshuffle|pick_confirm|pick_explain_all)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, pick_edit_text),
             ],
         },
@@ -2949,22 +3408,27 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("timeframe", cmd_timeframe))
 
-    # Strategy conversation handler
+    # Strategy/settings conversation handler
     strat_conv = ConversationHandler(
-        entry_points=[CommandHandler("strategy", cmd_strategy)],
+        entry_points=[
+            CommandHandler("strategy", cmd_strategy),
+            CommandHandler("settings", cmd_strategy),
+        ],
         states={
             STRAT_CUSTOM_CONFIDENCE: [
                 CallbackQueryHandler(callback_strat_custom_confidence, pattern=r"^strat_conf_"),
-                CallbackQueryHandler(callback_strategy_select, pattern=r"^strat_(conservative|balanced|aggressive|overs_only|btts_mix|favourites|custom|edit)$"),
+                CallbackQueryHandler(callback_strategy_select, pattern=r"^strat_(conf_menu|mkt_menu|odds_menu|back|done|conservative|balanced|aggressive|overs_only|btts_mix|favourites)$"),
             ],
             STRAT_CUSTOM_MARKETS: [
                 CallbackQueryHandler(callback_strat_custom_markets, pattern=r"^strat_mkt_"),
+                CallbackQueryHandler(callback_strategy_select, pattern=r"^strat_(back|done)$"),
             ],
             STRAT_CUSTOM_OVER: [
-                CallbackQueryHandler(callback_strat_custom_over, pattern=r"^strat_over_"),
+                CallbackQueryHandler(callback_strat_custom_over, pattern=r"^strat_"),
             ],
             STRAT_CUSTOM_MIN_ODDS: [
                 CallbackQueryHandler(callback_strat_custom_min_odds, pattern=r"^strat_minodds_"),
+                CallbackQueryHandler(callback_strategy_select, pattern=r"^strat_(back|done)$"),
             ],
         },
         fallbacks=[CommandHandler("cancel", strategy_cancel)],
@@ -2978,7 +3442,7 @@ def main():
         callback_league_toggle, pattern=r"^league_"
     ))
     app.add_handler(CallbackQueryHandler(
-        callback_strategy_select, pattern=r"^strat_(conservative|balanced|aggressive|overs_only|btts_mix|favourites)$"
+        callback_strategy_select, pattern=r"^strat_(conservative|balanced|aggressive|overs_only|btts_mix|favourites|conf_menu|mkt_menu|odds_menu|back|done)$"
     ))
     app.add_handler(CallbackQueryHandler(
         callback_timeframe, pattern=r"^tf_"
