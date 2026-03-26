@@ -678,6 +678,53 @@ def _add_extended_picks(
         _add("Away Over/Under", f"Over (total={threshold})", f"away_over_{threshold}", mkt_key, "12")
 
 
+def _add_thin_data_safe_picks(
+    all_scored: list[dict],
+    markets: dict,
+    base_pick: dict,
+):
+    """Add a small, controlled set of odds-based fallback picks when form data is thin."""
+
+    def _get_market_odds(market_key: str, outcome_id: str) -> float:
+        mkt = markets.get(market_key, {})
+        o = mkt.get("outcomes", {}).get(outcome_id, {})
+        try:
+            return float(o.get("odds", "0"))
+        except (ValueError, TypeError):
+            return 0.0
+
+    def _implied_confidence(odds: float, ceiling: int, floor: int = 42) -> int:
+        if odds <= 1.0:
+            return 0
+        return int(max(floor, min(ceiling, (1 / odds) * 58)))
+
+    def _add(market_name: str, pick_label: str, market_key: str, outcome_id: str, odds_cap: float, conf_cap: int):
+        odds = _get_market_odds(market_key, outcome_id)
+        if not (1.0 < odds <= odds_cap):
+            return
+        conf = _implied_confidence(odds, conf_cap)
+        all_scored.append({
+            **base_pick,
+            "market": market_name,
+            "pick": pick_label,
+            "odds": odds,
+            "confidence": conf,
+            "data_confidence": conf,
+            "verdict": "moderate" if conf >= 52 else "weak",
+            "analysis_reasons": [f"Thin-data fallback driven by strong market price: {odds:.2f}"],
+            "suggestion": None,
+            "data_quality": "limited",
+            "rating": "safe",
+        })
+
+    _add("Over/Under", "Over (total=0.5)", "18|total=0.5", "12", 1.30, 60)
+    _add("Over/Under", "Over (total=1.5)", "18|total=1.5", "12", 1.55, 56)
+    _add("Home Over/Under", "Over (total=0.5)", "19|total=0.5", "12", 1.45, 58)
+    _add("Away Over/Under", "Over (total=0.5)", "20|total=0.5", "12", 1.45, 58)
+    _add("Double Chance", "1X", "10", "9", 1.38, 56)
+    _add("Double Chance", "X2", "10", "11", 1.38, 56)
+
+
 # ── Config helpers ────────────────────────────────────────────────────────────
 
 def _get_pick_config(user_config: dict) -> dict:
@@ -1540,27 +1587,7 @@ async def _pick_analyze_from_message(message, context, target: float):
 
                 else:
                     # ── Odds-only analysis (no form data available) ──
-                    # Cap confidence low — odds are market prices, not analysis
-                    home_outcome = real_1x2.get("outcomes", {}).get("1", {})
-                    try:
-                        real_home_odds = float(home_outcome.get("odds", "0"))
-                    except (ValueError, TypeError):
-                        real_home_odds = 0
-
-                    if 1.01 < real_home_odds < 1.50:
-                        # Cap at 40% — no form data means low confidence regardless of odds
-                        implied_conf = int(min(40, (1 / real_home_odds) * 50))
-                        all_scored.append({
-                            **base_pick,
-                            "market": "1X2", "pick": "Home",
-                            "odds": real_home_odds,
-                            "confidence": implied_conf,
-                            "data_confidence": implied_conf,
-                            "verdict": "weak",
-                            "analysis_reasons": [f"⚠ No form data — odds-only estimate: {real_home_odds:.2f}"],
-                            "suggestion": None, "data_quality": "limited",
-                            "rating": "weak",
-                        })
+                    _add_thin_data_safe_picks(all_scored, markets, base_pick)
 
             except Exception as e:
                 logger.warning(f"Error analyzing {home_name} vs {away_name}: {e}")
@@ -1647,28 +1674,49 @@ def _is_safe_team_total_pick(p: dict) -> bool:
     return market in {"Home Over/Under", "Away Over/Under"} and threshold in (0.5, 1.5)
 
 
+def _is_thin_data_safe_pick(p: dict) -> bool:
+    """Return True for the small set of limited-data picks we allow as fallback only."""
+    market = p.get("market", "")
+    threshold = _pick_threshold(p)
+    if market in {"Home Over/Under", "Away Over/Under"} and threshold == 0.5:
+        return True
+    if market == "Over/Under" and threshold in (0.5, 1.5):
+        return True
+    if market == "Double Chance" and p.get("pick") in {"1X", "X2"}:
+        return True
+    return False
+
+
 def _pick_selection_score(p: dict) -> float:
     """Score a pick for combo ordering, with a bias toward safer goal markets."""
     conf = float(p.get("data_confidence", p.get("confidence", 50)) or 50)
     odds = float(p.get("odds", 1.0) or 1.0)
     market = p.get("market", "")
     threshold = _pick_threshold(p)
+    data_quality = p.get("data_quality", "unknown")
 
     bonus = 0.0
     if market in {"Home Over/Under", "Away Over/Under"}:
         if threshold == 0.5:
-            bonus += 10.0
+            bonus += 14.0
         elif threshold == 1.5:
-            bonus += 6.0
+            bonus += 8.0
     elif market == "Over/Under":
         if threshold == 0.5:
-            bonus += 4.0
+            bonus += 7.0
         elif threshold == 1.5:
-            bonus += 2.0
+            bonus += 4.0
     elif market == "Double Chance":
-        bonus += 3.0
+        bonus += 4.5
     elif market == "Draw No Bet":
         bonus += 2.0
+
+    if p.get("rating") == "safe":
+        bonus += 1.5
+    if data_quality == "limited":
+        bonus -= 8.0
+        if _is_thin_data_safe_pick(p):
+            bonus += 4.0
 
     odds_penalty = max(0.0, odds - 1.8) * 6.0
     return conf + bonus - odds_penalty
@@ -1677,10 +1725,26 @@ def _pick_selection_score(p: dict) -> float:
 def _pick_qualifies_for_combo(p: dict, min_confidence: int, min_pick_odds: float) -> bool:
     """Apply combo thresholds, with a small allowance for very safe team totals."""
     odds = float(p.get("odds", 0) or 0)
-    if p.get("data_quality") == "limited" or odds < min_pick_odds:
+    data_quality = p.get("data_quality")
+    if odds < min_pick_odds:
         return False
 
     conf = int(p.get("data_confidence", p.get("confidence", 50)) or 50)
+    if data_quality == "limited":
+        if not _is_thin_data_safe_pick(p):
+            return False
+        market = p.get("market", "")
+        threshold = _pick_threshold(p)
+        if market in {"Home Over/Under", "Away Over/Under"} and threshold == 0.5 and odds <= 1.45:
+            return conf >= max(48, min_confidence - 18)
+        if market == "Over/Under" and threshold == 0.5 and odds <= 1.30:
+            return conf >= max(50, min_confidence - 16)
+        if market == "Over/Under" and threshold == 1.5 and odds <= 1.55:
+            return conf >= max(52, min_confidence - 14)
+        if market == "Double Chance" and odds <= 1.38:
+            return conf >= max(50, min_confidence - 15)
+        return False
+
     if conf >= min_confidence:
         return True
 
@@ -1749,7 +1813,8 @@ def _build_fallback_profiles(pick_cfg: dict) -> list[dict]:
     seen = set()
 
     def add_profile(min_conf: int, min_odds: float, markets: list[str], notes: list[str]):
-        key = (min_conf, round(min_odds, 2), tuple(markets))
+        allow_limited_safe = any("thin-data" in note.lower() for note in notes)
+        key = (min_conf, round(min_odds, 2), tuple(markets), allow_limited_safe)
         if key in seen:
             return
         seen.add(key)
@@ -1758,6 +1823,7 @@ def _build_fallback_profiles(pick_cfg: dict) -> list[dict]:
             "min_odds": round(min_odds, 2),
             "preferred_markets": list(markets),
             "notes": list(notes),
+            "allow_limited_safe": allow_limited_safe,
         })
 
     add_profile(base_conf, base_odds, base_markets, [])
@@ -1802,6 +1868,13 @@ def _build_fallback_profiles(pick_cfg: dict) -> list[dict]:
             expansion_notes + [f"Added market: {market}"],
         )
 
+    add_profile(
+        current_conf,
+        current_odds,
+        expanded,
+        expansion_notes + ["Enabled thin-data fallback for safe low-line markets"],
+    )
+
     return profiles
 
 
@@ -1813,9 +1886,14 @@ def _build_qualified_pool(
     shuffle_seed: int = 0,
 ) -> list[dict]:
     """Filter and sort the scored pool using an effective config."""
+    allow_limited_safe = bool(pick_cfg.get("allow_limited_safe"))
     available = [
         p for p in all_scored
-        if _pick_key(p) not in excluded and p.get("data_quality") != "limited"
+        if _pick_key(p) not in excluded
+        and (
+            p.get("data_quality") != "limited"
+            or (allow_limited_safe and _is_thin_data_safe_pick(p))
+        )
     ]
 
     preferred_markets = pick_cfg.get("preferred_markets", DEFAULT_ENABLED_MARKETS)
@@ -1838,7 +1916,11 @@ def _build_qualified_pool(
     if market_slots:
         return [
             p for p in available
-            if p.get("odds", 0) > 1.0 and p.get("data_quality") != "limited"
+            if p.get("odds", 0) > 1.0
+            and (
+                p.get("data_quality") != "limited"
+                or (allow_limited_safe and _is_thin_data_safe_pick(p))
+            )
         ]
 
     return [
@@ -1906,6 +1988,20 @@ def _select_ticket_from_pool(
 
     league_counts: dict[str, int] = {}
     max_per_league = max(3, len(qualified) // 5) if qualified else 3
+    market_counts: dict[str, int] = {}
+    deferred_for_diversity: list[dict] = []
+
+    def _market_cap(pick: dict) -> int:
+        market = pick.get("market", "")
+        threshold = _pick_threshold(pick)
+        if market in {"Home Over/Under", "Away Over/Under"} and threshold == 0.5:
+            return 3
+        if market in {"Home Over/Under", "Away Over/Under", "Over/Under"}:
+            return 2
+        if market in {"Double Chance", "Draw No Bet"}:
+            return 2
+        return 1
+
     for pick in qualified:
         if current_odds >= target:
             break
@@ -1915,10 +2011,32 @@ def _select_ticket_from_pool(
         league = pick.get("league", "")
         if league_counts.get(league, 0) >= max_per_league:
             continue
+        market = pick.get("market", "")
+        if market_counts.get(market, 0) >= _market_cap(pick):
+            deferred_for_diversity.append(pick)
+            continue
         selected.append(pick)
         used_matches.add(match_key)
         current_odds *= pick["odds"]
         league_counts[league] = league_counts.get(league, 0) + 1
+        market_counts[market] = market_counts.get(market, 0) + 1
+
+    if current_odds < target:
+        for pick in deferred_for_diversity:
+            if current_odds >= target:
+                break
+            match_key = _match_key(pick)
+            if match_key in used_matches or match_key in disallowed_match_keys:
+                continue
+            league = pick.get("league", "")
+            if league_counts.get(league, 0) >= max_per_league + 1:
+                continue
+            selected.append(pick)
+            used_matches.add(match_key)
+            current_odds *= pick["odds"]
+            league_counts[league] = league_counts.get(league, 0) + 1
+            market = pick.get("market", "")
+            market_counts[market] = market_counts.get(market, 0) + 1
 
     return selected
 
