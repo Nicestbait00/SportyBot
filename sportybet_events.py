@@ -95,7 +95,7 @@ def _normalize_name(name: str) -> str:
 
 
 def fetch_all_events(
-    max_pages: int = 10,
+    max_pages: int = 20,
     allowed_tournaments: list[str] | None = None,
 ) -> list[dict]:
     """
@@ -110,6 +110,7 @@ def fetch_all_events(
     _filters = [s.lower() for s in allowed_tournaments] if allowed_tournaments else None
 
     all_events = []
+    consecutive_empty = 0
 
     for page in range(1, max_pages + 1):
         try:
@@ -137,10 +138,10 @@ def fetch_all_events(
                 tournament_name = t.get("name", "")
 
                 # Skip entire tournament if it doesn't match the filter
-                # Uses exact match (==) not substring to avoid "Serie A" matching "Brasileiro Serie A"
+                # Uses bidirectional substring to handle name variants
                 if _filters:
                     t_lower = tournament_name.lower().strip()
-                    if not any(f == t_lower for f in _filters):
+                    if not any(f in t_lower or t_lower in f for f in _filters):
                         continue
 
                 for e in t.get("events", []):
@@ -150,7 +151,11 @@ def fetch_all_events(
                         page_events += 1
 
             if page_events == 0:
-                break
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    break
+            else:
+                consecutive_empty = 0
 
         except Exception as ex:
             logger.warning(f"SportyBet fetch page {page} failed: {ex}")
@@ -243,6 +248,13 @@ def build_event_index(force: bool = False) -> dict:
     logger.info(f"Built SportyBet event index: {len(events)} events")
 
     return index
+
+
+def clear_cache():
+    """Delete the SportyBet event index cache so next fetch is fresh."""
+    if _INDEX_FILE.exists():
+        _INDEX_FILE.unlink()
+        logger.info("Cleared SportyBet event index cache")
 
 
 def find_event(home_name: str, away_name: str) -> Optional[dict]:

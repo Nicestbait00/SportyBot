@@ -233,6 +233,25 @@ AVAILABLE_MARKETS: dict[str, dict] = {
     },
 }
 
+# ── Market categories for cross-ticket hedging ────────────────────────────
+MARKET_CATEGORIES = {
+    "goals": ["Over/Under", "GG/NG", "Home Over/Under", "Away Over/Under",
+              "Over/Under & GG/NG", "1X2 & Over/Under", "Exact Goals"],
+    "result": ["1X2", "Double Chance", "Draw No Bet", "1X2 & GG/NG"],
+    "halftime": ["HT 1X2", "HT/FT", "HT Over/Under", "HT GG/NG"],
+    "other": ["Odd/Even", "Home Clean Sheet", "Away Clean Sheet",
+              "Handicap", "Correct Score"],
+}
+
+
+def get_market_category(market_name: str) -> str:
+    """Return the category for a market name, or 'other' if not found."""
+    for cat, markets in MARKET_CATEGORIES.items():
+        if market_name in markets:
+            return cat
+    return "other"
+
+
 # Default enabled markets for new users
 DEFAULT_ENABLED_MARKETS = [
     "1X2",
@@ -321,7 +340,7 @@ LEAGUE_SPORTYBET_NAMES: dict[int, list[str]] = {
     32: ["fifa world cup qualification, uefa"],
     30: ["fifa world cup qualification"],
     31: ["fifa world cup qualification"],
-    10: ["int. friendly games", "fifa series"],
+    10: ["int. friendly games", "fifa series", "international friendly", "international friendlies", "friendly international"],
 }
 
 

@@ -38,7 +38,9 @@ from config import (
     LEAGUE_CATEGORIES,
     LEAGUE_NAMES,
     LEAGUES,
+    MARKET_CATEGORIES,
     STRATEGY_PRESETS,
+    get_market_category,
     load_user_config,
     save_user_config,
 )
@@ -48,7 +50,8 @@ from web_analyzer import analyze_pick as web_analyze_pick, get_team_results, _su
 from scorer import score_match, cross_check_with_odds
 import gemini_chat
 from sportybet_events import (
-    build_event_index, fetch_all_events, filter_events, find_event,
+    build_event_index, clear_cache as clear_sportybet_cache,
+    fetch_all_events, filter_events, find_event,
     build_booking_selection, create_booking_code,
 )
 
@@ -64,7 +67,7 @@ TEAM_RESULTS_FETCH_CONCURRENCY = max(1, int(os.getenv("TEAM_RESULTS_FETCH_CONCUR
 # Conversation states for /check flow
 CHECK_CODES, CHECK_TARGET_ODDS, CHECK_EXCLUDE, CHECK_CONFIRM, CHECK_EXPAND, CHECK_REVIEW = range(6)
 # Conversation states for /pick flow
-PICK_TYPE, PICK_COUNT, PICK_ODDS, PICK_MODE, PICK_REVIEW = range(10, 15)
+PICK_TYPE, PICK_COUNT, PICK_ODDS, PICK_MODE, PICK_REVIEW, GAME_DIALOGUE = range(10, 16)
 # Conversation states for /strategy custom flow
 STRAT_CUSTOM_CONFIDENCE, STRAT_CUSTOM_MARKETS, STRAT_CUSTOM_OVER, STRAT_CUSTOM_MIN_ODDS = range(20, 24)
 
@@ -1386,7 +1389,7 @@ async def _pick_analyze_from_message(message, context, target: float):
                 allowed_tournaments.extend(LEAGUE_SPORTYBET_NAMES.get(lid, []))
 
         try:
-            all_sporty_events = await asyncio.to_thread(fetch_all_events, max_pages=5, allowed_tournaments=allowed_tournaments or None)
+            all_sporty_events = await asyncio.to_thread(fetch_all_events, max_pages=15, allowed_tournaments=allowed_tournaments or None)
         except Exception as e:
             logger.warning(f"SportyBet fetch failed: {e}")
             all_sporty_events = []
@@ -1966,13 +1969,29 @@ def _select_ticket_from_pool(
     target: float,
     market_slots: list[dict] | None = None,
     disallowed_match_keys: set[str] | None = None,
+    penalize_categories: set[str] | None = None,
 ) -> list[dict]:
-    """Build one ticket from a qualified pool using the existing greedy selector."""
+    """Build one ticket from a qualified pool using the existing greedy selector.
+
+    penalize_categories: market categories used heavily by previous tickets.
+    Picks from these categories get a score penalty to encourage hedging.
+    """
     disallowed_match_keys = disallowed_match_keys or set()
+    penalize_categories = penalize_categories or set()
+
+    def _hedged_score(p: dict) -> float:
+        base = _pick_selection_score(p)
+        if penalize_categories and get_market_category(p.get("market", "")) in penalize_categories:
+            base -= 15  # Significant penalty to push picks from other categories up
+        return base
 
     selected = []
     used_matches = set()
     current_odds = 1.0
+
+    # Re-sort with hedging penalty if active
+    if penalize_categories:
+        qualified = sorted(qualified, key=_hedged_score, reverse=True)
 
     if market_slots:
         for slot in market_slots:
@@ -2078,8 +2097,13 @@ def _select_unique_ticket_from_pool(
     reference_picks: list[dict],
     target: float,
     forbidden_pick_keys: set[str],
+    penalize_categories: set[str] | None = None,
 ) -> list[dict]:
-    """Build a unique ticket on the same fixtures using different markets."""
+    """Build a unique ticket on the same fixtures using different markets.
+
+    penalize_categories: categories to deprioritize for cross-ticket hedging.
+    """
+    penalize_categories = penalize_categories or set()
     forced_match_keys = [_match_key(p) for p in reference_picks]
     ref_by_match = {_match_key(p): p for p in reference_picks}
     by_match: dict[str, list[dict]] = {}
@@ -2094,9 +2118,15 @@ def _select_unique_ticket_from_pool(
     candidate_lists: dict[str, list[dict]] = {}
     for match_key in forced_match_keys:
         ref_pick = ref_by_match[match_key]
+        def _unique_score(p, ref=ref_pick):
+            score = _pick_selection_score(p) - abs(float(p.get("odds", 1.0)) - float(ref.get("odds", 1.0))) * 15
+            if penalize_categories and get_market_category(p.get("market", "")) in penalize_categories:
+                score -= 15
+            return score
+
         candidates = sorted(
             by_match.get(match_key, []),
-            key=lambda p: _pick_selection_score(p) - abs(float(p.get("odds", 1.0)) - float(ref_pick.get("odds", 1.0))) * 15,
+            key=_unique_score,
             reverse=True,
         )
         if not candidates:
@@ -2157,13 +2187,23 @@ def _generate_dynamic_bundle(
     for profile in profiles:
         bundle = []
         used_match_keys: set[str] = set()
+        prev_ticket_categories: set[str] = set()
         qualified = _build_qualified_pool(all_scored, excluded, profile, market_slots, shuffle_seed)
         for ticket_id in range(1, ticket_count + 1):
-            picks = _select_ticket_from_pool(qualified, target, market_slots, used_match_keys)
+            picks = _select_ticket_from_pool(
+                qualified, target, market_slots, used_match_keys,
+                penalize_categories=prev_ticket_categories if ticket_id > 1 else None,
+            )
             if not picks:
                 break
             bundle.append(_make_ticket_entry(ticket_id, "dynamic", target, picks, profile.get("notes", [])))
             used_match_keys.update({_match_key(p) for p in picks})
+            # Collect dominant categories from this ticket for hedging the next one
+            from collections import Counter
+            cat_counts = Counter(get_market_category(p.get("market", "")) for p in picks)
+            # Penalize categories that made up >40% of the ticket
+            threshold = max(1, len(picks) * 0.4)
+            prev_ticket_categories = {cat for cat, cnt in cat_counts.items() if cnt >= threshold}
         if len(bundle) > len(best_bundle):
             best_bundle = bundle
             best_profile = profile
@@ -2220,12 +2260,25 @@ def _generate_unique_bundle(
         bundle = [_make_ticket_entry(1, "unique", target, base_picks, profile.get("notes", []))]
         used_pick_keys = {_pick_key(p) for p in base_picks}
 
+        # Collect base ticket's dominant categories for hedging
+        from collections import Counter
+        base_cat_counts = Counter(get_market_category(p.get("market", "")) for p in base_picks)
+        base_threshold = max(1, len(base_picks) * 0.4)
+        prev_categories = {cat for cat, cnt in base_cat_counts.items() if cnt >= base_threshold}
+
         for ticket_id in range(2, ticket_count + 1):
-            picks = _select_unique_ticket_from_pool(qualified, base_picks, target, used_pick_keys)
+            picks = _select_unique_ticket_from_pool(
+                qualified, base_picks, target, used_pick_keys,
+                penalize_categories=prev_categories,
+            )
             if not picks:
                 break
             bundle.append(_make_ticket_entry(ticket_id, "unique", target, picks, profile.get("notes", [])))
             used_pick_keys.update({_pick_key(p) for p in picks})
+            # Update categories for next ticket
+            cat_counts = Counter(get_market_category(p.get("market", "")) for p in picks)
+            threshold = max(1, len(picks) * 0.4)
+            prev_categories = {cat for cat, cnt in cat_counts.items() if cnt >= threshold}
 
         if len(bundle) > len(best_bundle):
             best_bundle = bundle
@@ -2489,6 +2542,7 @@ async def _show_single_ticket_combo(message, context, ticket: dict, edit: bool =
         buttons.append([
             InlineKeyboardButton(f"❌ {idx + 1}", callback_data=f"pick_exclude_{idx}"),
             InlineKeyboardButton(f"🔄 {idx + 1}", callback_data=f"pick_change_{idx}"),
+            InlineKeyboardButton(f"💬 {idx + 1}", callback_data=f"pick_dialogue_{idx}"),
         ])
     buttons.append([
         InlineKeyboardButton("📖 Why these?", callback_data="pick_explain_all"),
@@ -2867,6 +2921,22 @@ async def pick_review_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             intro="Swap suggestions now open the market picker so you can choose the best replacement.",
         )
 
+    elif data.startswith("pick_dialogue_"):
+        idx = int(data.replace("pick_dialogue_", ""))
+        combo = context.user_data.get("pick_combo", [])
+        if idx < 0 or idx >= len(combo):
+            return PICK_REVIEW
+        context.user_data["dialogue_pick_idx"] = idx
+        pick = combo[idx]
+        # Show full analysis for this game
+        await _explain_picks(query.message, context, combo, [idx + 1])
+        await query.message.reply_text(
+            f"💬 Let's talk about: {pick['home']} vs {pick['away']}\n"
+            f"Current: {pick['market']}: {pick.get('pick', '')} @ {pick.get('odds', 0):.2f}\n\n"
+            "Suggest a different market (e.g. 'what about over 1.5?') or type 'done' to go back."
+        )
+        return GAME_DIALOGUE
+
     elif data.startswith("pick_change_"):
         idx = int(data.replace("pick_change_", ""))
         return await _show_pick_change_options(query.message, context, idx, edit=True)
@@ -3052,6 +3122,133 @@ async def _explain_picks(message, context, combo, pick_nums):
     return PICK_REVIEW
 
 
+async def game_dialogue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle per-game dialogue during combo review."""
+    text = update.message.text.strip()
+    idx = context.user_data.get("dialogue_pick_idx", -1)
+    combo = context.user_data.get("pick_combo", [])
+
+    if idx < 0 or idx >= len(combo):
+        await update.message.reply_text("Lost track of the game. Returning to review.")
+        context.user_data.pop("dialogue_pick_idx", None)
+        if context.user_data.get("_check_mode"):
+            return await _check_build_and_show(update.message, context)
+        return await _pick_build_combo(update.message, context)
+
+    # Exit dialogue
+    if text.lower() in ("done", "back", "exit", "return", "go back"):
+        context.user_data.pop("dialogue_pick_idx", None)
+        if context.user_data.get("_check_mode"):
+            return await _check_build_and_show(update.message, context)
+        return await _pick_build_combo(update.message, context)
+
+    pick = combo[idx]
+    all_scored = context.user_data.get("pick_all_scored", [])
+    match_key = _match_key(pick)
+
+    # Get all scored alternatives for this match
+    match_alts = [p for p in all_scored if _match_key(p) == match_key and _pick_key(p) != _pick_key(pick)]
+
+    # Use Gemini to understand the user's intent
+    result = await asyncio.to_thread(
+        gemini_chat.parse_game_dialogue, text, pick, match_alts
+    )
+
+    intent = result.get("intent", "chat")
+    params = result.get("params", {})
+    reply = result.get("reply", "")
+
+    if intent == "switch":
+        # User wants to switch to a specific market
+        target_market = params.get("market", "").lower()
+        target_pick = params.get("pick", "").lower()
+
+        # Find the best matching alternative
+        best_alt = None
+        best_score = -1
+        for alt in match_alts:
+            alt_market = alt.get("market", "").lower()
+            alt_pick = alt.get("pick", "").lower()
+            score = 0
+            if target_market and target_market in alt_market:
+                score += 2
+            if target_pick and target_pick in alt_pick:
+                score += 2
+            if target_market and alt_market in target_market:
+                score += 1
+            if score > best_score:
+                best_score = score
+                best_alt = alt
+
+        if best_alt and best_score > 0:
+            old_desc = f"{pick['market']}: {pick.get('pick', '')} @ {pick['odds']:.2f}"
+            # Apply the switch
+            for field in ["market", "pick", "odds", "confidence", "data_confidence",
+                          "verdict", "analysis_reasons", "data_quality", "rating"]:
+                if field in best_alt:
+                    pick[field] = best_alt[field]
+            new_desc = f"{pick['market']}: {pick.get('pick', '')} @ {pick['odds']:.2f}"
+            await update.message.reply_text(
+                f"✅ Switched!\n"
+                f"Was: {old_desc}\n"
+                f"Now: {new_desc} [{pick.get('confidence', '?')}%]\n\n"
+                "Type 'done' to return to your combo, or suggest another market."
+            )
+        else:
+            await update.message.reply_text(
+                reply or "That market isn't available for this match. "
+                "Try one of these:\n" + "\n".join(
+                    f"  • {a['market']}: {a.get('pick', '')} @ {a.get('odds', 0):.2f} [{a.get('confidence', '?')}%]"
+                    for a in sorted(match_alts, key=lambda x: x.get("confidence", 0), reverse=True)[:5]
+                )
+            )
+        return GAME_DIALOGUE
+
+    elif intent == "compare":
+        # Show comparison between current and suggested
+        if reply:
+            await update.message.reply_text(reply)
+        else:
+            # Build a comparison ourselves
+            target_market = params.get("market", "").lower()
+            relevant = [a for a in match_alts if target_market in a.get("market", "").lower()]
+            if not relevant:
+                relevant = match_alts[:4]
+            lines = [f"📊 Comparison for {pick['home']} vs {pick['away']}:\n"]
+            lines.append(f"Current: {pick['market']}: {pick.get('pick', '')} @ {pick['odds']:.2f} [{pick.get('confidence', '?')}%]")
+            for r in pick.get("analysis_reasons", [])[:2]:
+                lines.append(f"  > {r}")
+            lines.append("")
+            for alt in sorted(relevant, key=lambda x: x.get("confidence", 0), reverse=True)[:4]:
+                lines.append(f"Alternative: {alt['market']}: {alt.get('pick', '')} @ {alt.get('odds', 0):.2f} [{alt.get('confidence', '?')}%]")
+                for r in alt.get("analysis_reasons", [])[:1]:
+                    lines.append(f"  > {r}")
+            lines.append("\nSay 'switch to [market]' to change, or 'done' to go back.")
+            await update.message.reply_text("\n".join(lines))
+        return GAME_DIALOGUE
+
+    elif intent == "keep":
+        context.user_data.pop("dialogue_pick_idx", None)
+        await update.message.reply_text("👍 Keeping the original. Heading back to your combo.")
+        if context.user_data.get("_check_mode"):
+            return await _check_build_and_show(update.message, context)
+        return await _pick_build_combo(update.message, context)
+
+    else:
+        # General chat — relay Gemini's response
+        if reply:
+            await update.message.reply_text(reply)
+        else:
+            await update.message.reply_text(
+                "I'm not sure what you mean. You can:\n"
+                "• Suggest a market: 'what about over 1.5?'\n"
+                "• Compare: 'compare GG vs over 2.5'\n"
+                "• Switch: 'switch to double chance'\n"
+                "• Go back: 'done'"
+            )
+        return GAME_DIALOGUE
+
+
 async def _apply_combo_edits(message, context, combo, actions):
     """Apply edit actions to the combo (shared between /pick and /check)."""
     all_scored = context.user_data.get("pick_all_scored", context.user_data.get("check_all_scored", []))
@@ -3228,7 +3425,7 @@ async def pick_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Refresh cached data — fetches fixtures from football-data.org (2-week window)."""
+    """Refresh cached data — clears SportyBet event index + analysis cache, re-fetches."""
     job_token = _mark_job_start(context, "refresh")
     config = load_user_config(chat_id=update.effective_chat.id)
     leagues = config.get("leagues", [])
@@ -3238,54 +3435,50 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No leagues configured. Run /leagues first.")
         return
 
-    days_ahead = config.get("days_ahead", 7)
-    today = datetime.now()
-    date_from = today.strftime("%Y-%m-%d")
-    date_to = (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-
     await update.message.reply_text(
-        f"🔄 Refreshing {len(leagues)} leagues ({date_from} to {date_to})..."
+        f"🔄 Clearing caches and re-fetching from SportyBet for {len(leagues)} leagues..."
     )
 
-    total_fixtures = 0
-    league_results = []
-    sem = asyncio.Semaphore(min(REFRESH_CONCURRENCY, max(len(leagues), 1)))
+    # 1. Clear SportyBet event index
+    await asyncio.to_thread(clear_sportybet_cache)
 
-    async def _refresh_league(lid: int) -> tuple[int, str]:
-        name = LEAGUE_NAMES.get(lid, str(lid))
-        async with sem:
-            try:
-                fixtures = await asyncio.to_thread(
-                    get_fixtures_lookahead,
-                    lid,
-                    date_from=date_from,
-                    date_to=date_to,
-                )
-                return len(fixtures), f"  {name}: {len(fixtures)} matches"
-            except Exception as e:
-                logger.warning("Refresh failed for %s: %s", name, e)
-                return 0, f"  {name}: ERROR - {e}"
+    # 2. Clear analysis cache
+    from pathlib import Path
+    cache_dir = Path(__file__).resolve().parent / ".cache" / "analysis"
+    cleared = 0
+    if cache_dir.exists():
+        for f in cache_dir.glob("*.json"):
+            f.unlink()
+            cleared += 1
+
+    # 3. Re-fetch from SportyBet with user's league filter
+    from config import LEAGUE_SPORTYBET_NAMES
+    allowed_tournaments = []
+    for lid in leagues:
+        allowed_tournaments.extend(LEAGUE_SPORTYBET_NAMES.get(lid, []))
 
     try:
-        results = await asyncio.gather(*[_refresh_league(lid) for lid in leagues])
+        events = await asyncio.to_thread(
+            fetch_all_events,
+            max_pages=15,
+            allowed_tournaments=allowed_tournaments or None,
+        )
     except Exception as e:
         _mark_job_finish(context, job_token, success=False, error=e)
-        logger.exception("Refresh command failed")
-        await update.message.reply_text(
-            "Refresh failed before I could finish. Please try again shortly."
-        )
+        logger.exception("Refresh fetch failed")
+        await update.message.reply_text("Refresh failed — could not reach SportyBet. Try again shortly.")
         return
 
-    for fixture_count, line in results:
-        total_fixtures += fixture_count
-        league_results.append(line)
+    # 4. Rebuild event index
+    await asyncio.to_thread(build_event_index, True)
 
+    league_display = ", ".join(LEAGUE_NAMES.get(lid, str(lid)) for lid in leagues)
     msg = (
         f"✅ Refresh complete\n\n"
-        + "\n".join(league_results) + "\n\n"
-        f"Total fixtures: {total_fixtures}\n"
-        f"Window: {date_from} to {date_to}\n\n"
-        f"Run /pick to get selections."
+        f"Leagues: {league_display}\n"
+        f"Events fetched: {len(events)}\n"
+        f"Analysis cache cleared ({cleared} files)\n\n"
+        f"Run /pick to get fresh selections."
     )
     _mark_job_finish(context, job_token)
     await update.message.reply_text(msg)
@@ -4025,7 +4218,7 @@ async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
             lines.append(
                 f"{icon} {pick['home']} vs {pick['away']}\n"
                 f"   Code: {pick['market']}: {pick['pick']} @ {pick['odds']:.2f}\n"
-                f"   Score: {best_match['market']}: {best_match['pick']} [{conf}%]"
+                f"   Score: {best_match['market']}: {best_match['pick']} @ {best_match.get('odds', 0):.2f} [{conf}%]"
             )
             reasons = best_match.get("analysis_reasons", [])
             if reasons:
@@ -4092,7 +4285,7 @@ async def check_expand_callback(update: Update, context: ContextTypes.DEFAULT_TY
     for lid in leagues:
         tournament_filters.extend(LEAGUE_SPORTYBET_NAMES.get(lid, []))
 
-    events = await asyncio.to_thread(fetch_all_events, max_pages=5, allowed_tournaments=tournament_filters)
+    events = await asyncio.to_thread(fetch_all_events, max_pages=15, allowed_tournaments=tournament_filters)
     events = filter_events(events, league_ids=leagues, timeframe=timeframe)
 
     league_scored = []
@@ -4389,10 +4582,26 @@ async def check_review_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(f"❌ Excluded: {removed['home']} vs {removed['away']} ({removed.get('pick', '')})\nRebuilding...")
         return await _check_build_and_show(query.message, context)
 
+    if data.startswith("pick_dialogue_"):
+        idx = int(data.replace("pick_dialogue_", ""))
+        combo = context.user_data.get("pick_combo", [])
+        if idx < 0 or idx >= len(combo):
+            return CHECK_REVIEW
+        context.user_data["dialogue_pick_idx"] = idx
+        pick = combo[idx]
+        await _explain_picks(query.message, context, combo, [idx + 1])
+        await query.message.reply_text(
+            f"💬 Let's talk about: {pick['home']} vs {pick['away']}\n"
+            f"Current: {pick['market']}: {pick.get('pick', '')} @ {pick.get('odds', 0):.2f}\n\n"
+            "Suggest a different market (e.g. 'what about over 1.5?') or type 'done' to go back."
+        )
+        return GAME_DIALOGUE
+
     if data.startswith("pick_change_") or data.startswith("pick_mkt_") or data.startswith("pick_swap_"):
         # Delegate to pick's review handler, then route back to check
         result = await pick_review_callback(update, context)
-        # The pick handler returns PICK_REVIEW, but we need CHECK_REVIEW
+        # Sync pick_combo back to check_combo after market change
+        context.user_data["check_combo"] = context.user_data.get("pick_combo", [])
         return CHECK_REVIEW
 
     return CHECK_REVIEW
@@ -4685,8 +4894,11 @@ def main():
                 CallbackQueryHandler(check_receive_odds_button, pattern=r"^check_odds_"),
             ],
             CHECK_REVIEW: [
-                CallbackQueryHandler(check_review_callback, pattern=r"^(pick_exclude_\d+|pick_swap_\d+|pick_change_\d+|pick_mkt_.+|pick_reshuffle|pick_confirm|pick_explain_all)$"),
+                CallbackQueryHandler(check_review_callback, pattern=r"^(pick_exclude_\d+|pick_swap_\d+|pick_change_\d+|pick_dialogue_\d+|pick_mkt_.+|pick_reshuffle|pick_confirm|pick_explain_all)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, check_edit_text),
+            ],
+            GAME_DIALOGUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, game_dialogue_handler),
             ],
         },
         fallbacks=[CommandHandler("cancel", check_cancel)],
@@ -4718,8 +4930,11 @@ def main():
                 CallbackQueryHandler(pick_receive_mode_button, pattern=r"^pick_mode_"),
             ],
             PICK_REVIEW: [
-                CallbackQueryHandler(pick_review_callback, pattern=r"^(pick_exclude_\d+|pick_swap_\d+|pick_change_\d+|pick_mkt_.+|pick_reshuffle|pick_confirm|pick_explain_all|pick_bundle_.+)$"),
+                CallbackQueryHandler(pick_review_callback, pattern=r"^(pick_exclude_\d+|pick_swap_\d+|pick_change_\d+|pick_dialogue_\d+|pick_mkt_.+|pick_reshuffle|pick_confirm|pick_explain_all|pick_bundle_.+)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, pick_edit_text),
+            ],
+            GAME_DIALOGUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, game_dialogue_handler),
             ],
         },
         fallbacks=[CommandHandler("cancel", pick_cancel)],

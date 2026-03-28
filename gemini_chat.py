@@ -465,3 +465,123 @@ def _fallback_parse(message: str) -> dict:
         "params": {},
         "reply": "I'm SportyBot — your football betting assistant. Try asking for picks (e.g. '10 odds') or type /help to see commands.",
     }
+
+
+# ── Per-game dialogue ────────────────────────────────────────────────────
+
+GAME_DIALOGUE_PROMPT = """\
+You are SportyBot, discussing a specific football match with the user during combo review.
+
+**Current pick:**
+{current_pick}
+
+**Available alternatives for this match:**
+{alternatives}
+
+The user is asking about this specific game. Your job:
+1. Understand their intent and return structured JSON
+2. Give data-backed opinions — reference confidence scores, odds, and analysis reasons
+
+**Intents:**
+- "compare": User wants to compare markets (e.g. "what about over 1.5?", "how does GG look?")
+  → Show a brief comparison with confidence and reasoning. Params: {{"market": "the market they asked about"}}
+- "switch": User wants to switch to a different market (e.g. "change to double chance", "switch it")
+  → Params: {{"market": "market name", "pick": "specific outcome"}}
+- "keep": User wants to keep the current pick (e.g. "keep it", "nah leave it", "it's fine")
+- "chat": General question about the game or anything else
+  → Give a warm, data-backed reply
+
+Respond ONLY with valid JSON:
+{{"intent": "compare|switch|keep|chat", "params": {{}}, "reply": "your message"}}
+"""
+
+
+def parse_game_dialogue(message: str, current_pick: dict, alternatives: list[dict]) -> dict:
+    """Parse a user message during per-game dialogue using Gemini."""
+    # Build context strings
+    current_str = (
+        f"{current_pick.get('home', '')} vs {current_pick.get('away', '')}\n"
+        f"Market: {current_pick.get('market', '')} | Pick: {current_pick.get('pick', '')} "
+        f"| Odds: {current_pick.get('odds', 0):.2f} | Confidence: {current_pick.get('confidence', '?')}%\n"
+        f"Reasons: {'; '.join(current_pick.get('analysis_reasons', [])[:3])}"
+    )
+
+    alt_lines = []
+    for a in sorted(alternatives, key=lambda x: x.get("confidence", 0), reverse=True)[:8]:
+        alt_lines.append(
+            f"- {a.get('market', '')}: {a.get('pick', '')} @ {a.get('odds', 0):.2f} "
+            f"[{a.get('confidence', '?')}%] — {'; '.join(a.get('analysis_reasons', [])[:1])}"
+        )
+    alt_str = "\n".join(alt_lines) if alt_lines else "No alternatives scored for this match."
+
+    if not GEMINI_API_KEY:
+        return _fallback_game_dialogue(message, alternatives)
+
+    prompt = GAME_DIALOGUE_PROMPT.format(current_pick=current_str, alternatives=alt_str)
+
+    body = {
+        "contents": [{"parts": [{"text": f"User says: {message}"}]}],
+        "systemInstruction": {"parts": [{"text": prompt}]},
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 512},
+    }
+
+    try:
+        resp = requests.post(
+            GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        text = (
+            data.get("candidates", [{}])[0]
+            .get("content", {}).get("parts", [{}])[0].get("text", "")
+        )
+        text = text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+
+        result = json.loads(text)
+        for key in ("intent", "params", "reply"):
+            if key not in result:
+                result[key] = "chat" if key == "intent" else {} if key == "params" else ""
+
+        allowed = {"compare", "switch", "keep", "chat"}
+        if result["intent"] not in allowed:
+            result["intent"] = "chat"
+        return result
+
+    except Exception as e:
+        logger.warning(f"Gemini game dialogue error: {e}")
+        return _fallback_game_dialogue(message, alternatives)
+
+
+def _fallback_game_dialogue(message: str, alternatives: list[dict]) -> dict:
+    """Regex fallback for game dialogue parsing."""
+    msg = message.lower().strip()
+
+    # Keep
+    if any(w in msg for w in ("keep", "leave", "fine", "ok", "good", "nah")):
+        return {"intent": "keep", "params": {}, "reply": ""}
+
+    # Switch
+    switch_match = re.search(r"(?:switch|change|swap)\s+(?:to\s+)?(.+)", msg)
+    if switch_match:
+        market = switch_match.group(1).strip()
+        return {"intent": "switch", "params": {"market": market, "pick": ""}, "reply": ""}
+
+    # Compare — "what about X", "how does X look"
+    compare_match = re.search(r"(?:what about|how about|how does|how is|compare)\s+(.+?)(?:\?|$)", msg)
+    if compare_match:
+        market = compare_match.group(1).strip()
+        return {"intent": "compare", "params": {"market": market}, "reply": ""}
+
+    # Market mention
+    for alt in alternatives[:8]:
+        alt_market = alt.get("market", "").lower()
+        alt_pick = alt.get("pick", "").lower()
+        if alt_market in msg or alt_pick in msg:
+            return {"intent": "compare", "params": {"market": alt_market}, "reply": ""}
+
+    return {"intent": "chat", "params": {}, "reply": ""}
