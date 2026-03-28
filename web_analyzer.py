@@ -142,7 +142,13 @@ def _load_fd_team_map():
             pass
 
     # Build from API
-    competitions = ["PL", "PD", "SA", "BL1", "FL1", "CL", "DED", "PPL", "ELC", "BSA"]
+    # Club + international competitions for broader coverage
+    competitions = [
+        # Club
+        "PL", "PD", "SA", "BL1", "FL1", "CL", "DED", "PPL", "ELC", "BSA",
+        # International
+        "EC", "WC", "CLI",
+    ]
     team_map = {}
 
     for comp in competitions:
@@ -405,11 +411,15 @@ def get_team_results(team_name: str, count: int = 10) -> list[dict]:
     except Exception:
         pass  # API-Football unavailable or cache miss with no budget — no problem
 
-    # Source 3: thesportsdb.com (fallback — always free, always available)
-    if not all_results:  # Only use if we got nothing from the others
-        sdb_id = sportsdb_search_team(team_name)
-        if sdb_id:
-            _add_results(sportsdb_get_last_results(sdb_id))
+    # Source 3: thesportsdb.com (always free, always available)
+    # Try whenever we have fewer results than requested — not just when empty
+    if len(all_results) < count:
+        try:
+            sdb_id = sportsdb_search_team(team_name)
+            if sdb_id:
+                _add_results(sportsdb_get_last_results(sdb_id))
+        except Exception:
+            pass  # thesportsdb unavailable — no problem
 
     # Sort by date (most recent first) and limit
     all_results.sort(key=lambda r: r["date"], reverse=True)

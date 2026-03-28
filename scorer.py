@@ -138,7 +138,7 @@ def _score_home_win(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> d
     if hf["home_played"] >= 2:
         home_home_wr = hf["home_wins"] / hf["home_played"]
         s2 = home_home_wr * 20
-        reasons.append(f"Home record: {hf['home_wins']}W/{hf['home_played']} at home")
+        reasons.append(f"They've won {hf['home_wins']} of {hf['home_played']} games at home")
     else:
         home_home_wr = home_wr
         s2 = home_wr * 15  # Less weight if insufficient home data
@@ -151,7 +151,7 @@ def _score_home_win(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> d
     if af["away_played"] >= 2:
         away_away_lr = af["away_losses"] / af["away_played"]
         s4 = away_away_lr * 20
-        reasons.append(f"Away losses on road: {af['away_losses']}L/{af['away_played']}")
+        reasons.append(f"The away team has lost {af['away_losses']} of {af['away_played']} games on the road")
     else:
         away_away_lr = away_lr
         s4 = away_lr * 15
@@ -168,9 +168,9 @@ def _score_home_win(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> d
     s5 = momentum * 15
 
     if home_recent_wins >= 2:
-        reasons.append(f"Home on {home_recent_wins}W streak in last 3")
+        reasons.append(f"Home team on a {home_recent_wins}-game winning streak")
     if away_recent_losses >= 2:
-        reasons.append(f"Away lost {away_recent_losses}/3 recent")
+        reasons.append(f"The away team lost {away_recent_losses} of their last 3 games")
 
     # 6. Goal difference quality (15 pts)
     home_gd_per_game = (hf["avg_scored"] - hf["avg_conceded"])
@@ -188,7 +188,7 @@ def _score_home_win(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> d
 
     confidence = max(0, min(95, int(raw)))
 
-    reasons.insert(0, f"Form: {hf['form_string']} ← recent ({hf['wins']}W/{hf['played']})")
+    reasons.insert(0, f"Home team form: {hf['form_string']} — won {hf['wins']} of last {hf['played']} games")
 
     return {"confidence": confidence, "reasons": reasons}
 
@@ -203,7 +203,7 @@ def _score_away_win(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> d
     if af["away_played"] >= 2:
         away_away_wr = af["away_wins"] / af["away_played"]
         s2 = away_away_wr * 20
-        reasons.append(f"Away record: {af['away_wins']}W/{af['away_played']} on road")
+        reasons.append(f"They've won {af['away_wins']} of {af['away_played']} games away from home")
     else:
         away_away_wr = away_wr
         s2 = away_wr * 15
@@ -214,7 +214,7 @@ def _score_away_win(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> d
     if hf["home_played"] >= 2:
         home_home_lr = hf["home_losses"] / hf["home_played"]
         s4 = home_home_lr * 20
-        reasons.append(f"Home losses at home: {hf['home_losses']}L/{hf['home_played']}")
+        reasons.append(f"The home team has lost {hf['home_losses']} of {hf['home_played']} home games")
     else:
         home_home_lr = home_lr
         s4 = home_lr * 15
@@ -240,7 +240,7 @@ def _score_away_win(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> d
 
     confidence = max(0, min(95, int(raw)))
 
-    reasons.insert(0, f"Form: {af['form_string']} ← recent ({af['wins']}W/{af['played']})")
+    reasons.insert(0, f"Away team form: {af['form_string']} — won {af['wins']} of last {af['played']} games")
 
     return {"confidence": confidence, "reasons": reasons}
 
@@ -280,9 +280,8 @@ def _score_over(hf: dict, af: dict, hr: list, ar: list, threshold: float, sig: d
     s1 = combined_over_rate * 30
 
     reasons.append(
-        f"Over {threshold} hit rate: "
-        f"Home {home_over_count}/{len(hr)} ({home_over_rate*100:.0f}%), "
-        f"Away {away_over_count}/{len(ar)} ({away_over_rate*100:.0f}%)"
+        f"Over {threshold} goals landed in {home_over_count} of {len(hr)} home team games "
+        f"and {away_over_count} of {len(ar)} away team games"
     )
 
     # 2. Venue-adjusted expected goals (20 pts)
@@ -303,7 +302,7 @@ def _score_over(hf: dict, af: dict, hr: list, ar: list, threshold: float, sig: d
     # 1 goal excess → ~15/20 pts, 2+ → full marks
     s2 = min(1, excess / 2) * 20
 
-    reasons.append(f"Expected goals: {venue_expected:.1f} (venue-adjusted)")
+    reasons.append(f"Based on venue stats, we expect around {venue_expected:.1f} goals in this match")
 
     # 3. Poisson probability (20 pts)
     poisson_prob = _poisson_over_prob(venue_expected, threshold)
@@ -328,7 +327,7 @@ def _score_over(hf: dict, af: dict, hr: list, ar: list, threshold: float, sig: d
     s4 = max(0, s4)
 
     if recent_avg_total > threshold + 0.5:
-        reasons.append(f"Recent avg total: {recent_avg_total:.1f} goals/game (trending up)")
+        reasons.append(f"Recent games are averaging {recent_avg_total:.1f} goals — scoring is trending up")
 
     # 5. Attack vs defence mismatch (15 pts)
     # Home attack vs away defence + away attack vs home defence
@@ -388,8 +387,8 @@ def _score_btts(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> dict:
     s1 = combined_btts_rate * 35
 
     reasons.append(
-        f"BTTS rate: Home {home_btts}/{len(hr)} ({home_btts_rate*100:.0f}%), "
-        f"Away {away_btts}/{len(ar)} ({away_btts_rate*100:.0f}%)"
+        f"Both teams scored in {home_btts} of {len(hr)} home team games "
+        f"and {away_btts} of {len(ar)} away team games"
     )
 
     # 2. Scoring consistency — how often each team scores at least 1 (25 pts)
@@ -404,7 +403,7 @@ def _score_btts(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> dict:
     s2 = scoring_consistency * 25
 
     if scoring_consistency >= 0.7:
-        reasons.append(f"Both teams score often: {home_score_rate*100:.0f}% / {away_score_rate*100:.0f}%")
+        reasons.append(f"Both teams find the net regularly — home scores in {home_score_rate*100:.0f}% of games, away in {away_score_rate*100:.0f}%")
 
     # 3. Defensive vulnerability — how often each team concedes (20 pts)
     home_concedes = sum(1 for r in hr if r["goals_against"] >= 1)
@@ -432,7 +431,7 @@ def _score_btts(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> dict:
     s4 = min(1, venue_scoring) * 20
 
     if venue_scoring >= 1.0:
-        reasons.append(f"Venue scoring: Home {home_venue_gs:.1f}/g, Away {away_venue_gs:.1f}/g")
+        reasons.append(f"At their venues, home team averages {home_venue_gs:.1f} goals/game and away team {away_venue_gs:.1f}")
 
     raw = s1 + s2 + s3 + s4
 
@@ -456,7 +455,7 @@ def _score_draw(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> dict:
     combined = (home_draws + away_draws) / 2
     s1 = combined * 40
 
-    reasons.append(f"Draw rate: Home {hf['draws']}/{hf['played']}, Away {af['draws']}/{af['played']}")
+    reasons.append(f"Home team drew {hf['draws']} of {hf['played']} games, away team drew {af['draws']} of {af['played']}")
 
     # Closeness of team quality (small GD gap = more draws)
     home_gd = hf["avg_scored"] - hf["avg_conceded"]
@@ -466,7 +465,7 @@ def _score_draw(hf: dict, af: dict, hr: list, ar: list, sig: dict = {}) -> dict:
     s2 = closeness * 30
 
     if closeness > 0.6:
-        reasons.append(f"Teams closely matched (GD gap: {gd_gap:.1f})")
+        reasons.append(f"These teams are closely matched — very similar goal difference")
 
     # Recent draws
     recent_home_draws = sum(1 for r in hr[:5] if r["result"] == "D")
@@ -488,18 +487,18 @@ def _score_double_chance(win_score: dict, other: any, hf: dict, af: dict, hr: li
         # Home or Draw — complement of Away Win
         home_non_loss = (hf["wins"] + hf["draws"]) / max(hf["played"], 1)
         conf = int(min(95, home_non_loss * 80 + 10))
-        reasons.append(f"Home non-loss rate: {home_non_loss*100:.0f}%")
+        reasons.append(f"Home team avoids defeat in {home_non_loss*100:.0f}% of games")
     elif label == "X2":
         away_non_loss = (af["wins"] + af["draws"]) / max(af["played"], 1)
         conf = int(min(95, away_non_loss * 80 + 10))
-        reasons.append(f"Away non-loss rate: {away_non_loss*100:.0f}%")
+        reasons.append(f"Away team avoids defeat in {away_non_loss*100:.0f}% of games")
     elif label == "12":
         # Either team wins — complement of Draw
         home_draws = hf["draws"] / max(hf["played"], 1)
         away_draws = af["draws"] / max(af["played"], 1)
         draw_prob = (home_draws + away_draws) / 2
         conf = int(min(95, (1 - draw_prob) * 85 + 5))
-        reasons.append(f"Non-draw rate: {(1-draw_prob)*100:.0f}%")
+        reasons.append(f"A decisive result (no draw) happens in {(1-draw_prob)*100:.0f}% of these teams' games")
     else:
         conf = 50
 
@@ -515,7 +514,7 @@ def _score_draw_no_bet(win_score: dict, hf: dict, af: dict, sig: dict, side: str
     # Boost by estimated draw probability (since draws don't lose)
     draw_boost = min(15, int((hf["draws"] + af["draws"]) / max(hf["played"] + af["played"], 1) * 30))
     conf = min(95, base_conf + draw_boost)
-    reasons = win_score["reasons"][:] + [f"Draw refund boost: +{draw_boost}%"]
+    reasons = win_score["reasons"][:] + [f"If it's a draw you get your stake back — adds {draw_boost}% safety"]
     return {"confidence": conf, "reasons": reasons}
 
 
@@ -537,7 +536,7 @@ def _score_odd_even(hf: dict, af: dict, hr: list, ar: list, parity: str) -> dict
     rate = count / max(len(totals), 1)
     # Odd/Even is close to 50/50 — confidence rarely goes above 65
     conf = int(min(70, 30 + rate * 45))
-    reasons.append(f"{parity.title()} goals in {count}/{len(totals)} recent games ({rate*100:.0f}%)")
+    reasons.append(f"An {parity} number of goals was scored in {count} of {len(totals)} recent games ({rate*100:.0f}%)")
 
     return {"confidence": conf, "reasons": reasons}
 
@@ -555,14 +554,14 @@ def _score_clean_sheet(hf: dict, af: dict, hr: list, ar: list, side: str) -> dic
         opp_fail = sum(1 for r in ar if r["goals_for"] == 0)
         opp_fail_rate = opp_fail / max(len(ar), 1)
         combined = (cs_rate * 0.6 + opp_fail_rate * 0.4)
-        reasons.append(f"Home CS rate: {cs_count}/{len(hr)}, Away blanks: {opp_fail}/{len(ar)}")
+        reasons.append(f"Home team kept a clean sheet in {cs_count} of {len(hr)} games, away team failed to score in {opp_fail} of {len(ar)}")
     else:
         cs_count = sum(1 for r in ar if r["goals_against"] == 0)
         cs_rate = cs_count / max(len(ar), 1)
         opp_fail = sum(1 for r in hr if r["goals_for"] == 0)
         opp_fail_rate = opp_fail / max(len(hr), 1)
         combined = (cs_rate * 0.6 + opp_fail_rate * 0.4)
-        reasons.append(f"Away CS rate: {cs_count}/{len(ar)}, Home blanks: {opp_fail}/{len(hr)}")
+        reasons.append(f"Away team kept a clean sheet in {cs_count} of {len(ar)} games, home team failed to score in {opp_fail} of {len(hr)}")
 
     conf = int(min(90, combined * 85 + 5))
     return {"confidence": conf, "reasons": reasons}
@@ -578,16 +577,16 @@ def _score_ht_result(hf: dict, af: dict, hr: list, ar: list, result_type: str) -
     if result_type == "home":
         base_rate = hf["wins"] / max(hf["played"], 1)
         conf = int(min(80, base_rate * 55 + 10))
-        reasons.append(f"Home FT win rate: {hf['wins']}/{hf['played']} (HT dampened)")
+        reasons.append(f"Home team wins {hf['wins']} of {hf['played']} full-time — adjusted down for half-time")
     elif result_type == "away":
         base_rate = af["wins"] / max(af["played"], 1)
         conf = int(min(80, base_rate * 50 + 8))
-        reasons.append(f"Away FT win rate: {af['wins']}/{af['played']} (HT dampened)")
+        reasons.append(f"Away team wins {af['wins']} of {af['played']} full-time — adjusted down for half-time")
     else:
         # Draws are more common at HT
         draw_rate = (hf["draws"] + af["draws"]) / max(hf["played"] + af["played"], 1)
         conf = int(min(80, draw_rate * 60 + 25))
-        reasons.append(f"Draw tendency (HT more likely): {draw_rate*100:.0f}%")
+        reasons.append(f"Draws are more common at half-time — draw tendency is {draw_rate*100:.0f}%")
 
     return {"confidence": conf, "reasons": reasons}
 
@@ -602,7 +601,7 @@ def _score_ht_over(hf: dict, af: dict, hr: list, ar: list, threshold: float) -> 
 
     excess = max(0, ht_expected - threshold)
     conf = int(min(85, 25 + excess * 35))
-    reasons.append(f"Expected HT goals: ~{ht_expected:.1f} (from {expected_total:.1f} FT expected)")
+    reasons.append(f"We expect ~{ht_expected:.1f} goals by half-time based on {expected_total:.1f} expected for the full match")
 
     return {"confidence": conf, "reasons": reasons}
 
@@ -619,7 +618,7 @@ def _score_ht_btts(hf: dict, af: dict, hr: list, ar: list) -> dict:
     # HT BTTS happens maybe 40% as often as FT BTTS
     ht_rate = ft_rate * 0.4
     conf = int(min(70, ht_rate * 80 + 10))
-    reasons.append(f"FT BTTS rate: {ft_rate*100:.0f}% → HT estimate: {ht_rate*100:.0f}%")
+    reasons.append(f"Both teams score full-time {ft_rate*100:.0f}% of the time — by half-time that drops to ~{ht_rate*100:.0f}%")
 
     return {"confidence": conf, "reasons": reasons}
 
@@ -643,7 +642,7 @@ def _score_team_over(form: dict, results: list, threshold: float, side: str) -> 
     s3 = poisson_prob * 20
 
     conf = int(min(95, s1 + s2 + s3))
-    reasons.append(f"{side.title()} scores >{threshold} in {over_count}/{len(results)} games (avg: {avg_scored:.1f})")
+    reasons.append(f"{side.title()} team scored over {threshold} in {over_count} of {len(results)} games — they average {avg_scored:.1f} goals/game")
 
     return {"confidence": conf, "reasons": reasons}
 
@@ -656,7 +655,7 @@ def _score_combo(score_a: dict, score_b: dict, label: str) -> dict:
     prob_b = score_b["confidence"] / 100
     combined = prob_a * prob_b
     conf = int(min(90, combined * 100))
-    reasons = [f"{label}: {score_a['confidence']}% × {score_b['confidence']}% = {conf}%"]
+    reasons = [f"Both conditions need to hit — combined chance is {conf}%"]
     reasons.extend(score_a["reasons"][:1])
     reasons.extend(score_b["reasons"][:1])
     return {"confidence": conf, "reasons": reasons}
@@ -668,7 +667,7 @@ def _score_combo_neg(win_score: dict, neg_score: dict, label: str) -> dict:
     prob_b_neg = 1 - (neg_score["confidence"] / 100)
     combined = prob_a * prob_b_neg
     conf = int(min(90, combined * 100))
-    reasons = [f"{label}: {win_score['confidence']}% × {100 - neg_score['confidence']}% = {conf}%"]
+    reasons = [f"Both conditions need to hit — combined chance is {conf}%"]
     return {"confidence": conf, "reasons": reasons}
 
 
@@ -683,7 +682,7 @@ def _score_conditional_or(score_a: dict, score_b: dict, label: str) -> dict:
     # P(A or B) using inclusion-exclusion
     combined = prob_a + prob_b - (prob_a * prob_b)
     conf = int(min(95, combined * 100))
-    reasons = [f"{label}: {score_a['confidence']}% or {score_b['confidence']}% → {conf}%"]
+    reasons = [f"Either condition can win this bet — combined chance is {conf}%"]
     reasons.extend(score_a["reasons"][:1])
     reasons.extend(score_b["reasons"][:1])
     return {"confidence": conf, "reasons": reasons}
@@ -706,7 +705,7 @@ def _apply_win_signals(sig: dict, side: str, reasons: list) -> float:
         # +1.0 xG advantage → +8 pts, capped at ±10
         xg_bonus = max(-10, min(10, xg_diff * 8))
         adj += xg_bonus
-        reasons.append(f"xG: {sig['xg_home']:.1f} vs {sig['xg_away']:.1f} ({'+' if xg_bonus > 0 else ''}{xg_bonus:.0f})")
+        reasons.append(f"Expected goals model: home {sig['xg_home']:.1f} vs away {sig['xg_away']:.1f}")
 
     # ── Injury impact ──
     own_key = f"{side}_injuries"
@@ -719,17 +718,17 @@ def _apply_win_signals(sig: dict, side: str, reasons: list) -> float:
         inj_adj = max(-12, min(8, inj_adj))
         adj += inj_adj
         if inj_adj != 0:
-            reasons.append(f"Injuries: {side} missing {own_inj}, opp missing {opp_inj} ({'+' if inj_adj > 0 else ''}{inj_adj:.0f})")
+            reasons.append(f"{side.title()} team missing {own_inj} key player(s), opponent missing {opp_inj}")
 
     # ── Star player missing ──
     own_star = sig.get(f"{side}_missing_star", False)
     opp_star = sig.get(("away_missing_star" if side == "home" else "home_missing_star"), False)
     if own_star:
         adj -= 8
-        reasons.append(f"⚠ {side.title()} star player missing (-8)")
+        reasons.append(f"⚠ {side.title()} team's star player is missing — big blow")
     if opp_star:
         adj += 5
-        reasons.append(f"Opponent star player missing (+5)")
+        reasons.append(f"Opponent's star player is missing — advantage")
 
     # ── Head-to-head ──
     if "h2h_results" in sig and len(sig["h2h_results"]) >= 3:
@@ -743,7 +742,7 @@ def _apply_win_signals(sig: dict, side: str, reasons: list) -> float:
         h2h_adj = max(-8, min(8, h2h_adj))
         adj += h2h_adj
         if abs(h2h_adj) >= 3:
-            reasons.append(f"H2H: {wins}/{len(h2h)} wins ({'+' if h2h_adj > 0 else ''}{h2h_adj:.0f})")
+            reasons.append(f"Head-to-head: won {wins} of the last {len(h2h)} meetings")
 
     # ── Motivation ──
     if "motivation" in sig:
@@ -753,7 +752,7 @@ def _apply_win_signals(sig: dict, side: str, reasons: list) -> float:
         mot_diff = max(-6, min(6, mot_diff))
         adj += mot_diff
         if abs(mot_diff) >= 3:
-            reasons.append(f"Motivation edge: {'+' if mot_diff > 0 else ''}{mot_diff:.0f}")
+            reasons.append(f"This team has more to play for — motivation edge")
 
     return adj
 
@@ -769,7 +768,7 @@ def _apply_goals_signals(sig: dict, threshold: float, reasons: list) -> float:
         # +1 goal above threshold → +8, -1 below → -8
         xg_adj = max(-10, min(10, xg_excess * 8))
         adj += xg_adj
-        reasons.append(f"xG total: {xg_total:.1f} vs line {threshold} ({'+' if xg_adj > 0 else ''}{xg_adj:.0f})")
+        reasons.append(f"Expected goals model predicts {xg_total:.1f} total goals vs the {threshold} line")
 
     # ── Injuries → fewer goals? ──
     total_injuries = sig.get("home_injuries", 0) + sig.get("away_injuries", 0)
@@ -778,14 +777,14 @@ def _apply_goals_signals(sig: dict, threshold: float, reasons: list) -> float:
         # attacking injuries generally reduce goals
         inj_adj = -min(6, total_injuries * 1.5)
         adj += inj_adj
-        reasons.append(f"Combined injuries: {total_injuries} key players out ({inj_adj:.0f})")
+        reasons.append(f"{total_injuries} key players missing across both teams — could reduce goals")
 
     # ── Star attackers missing reduces goals ──
     stars_out = (1 if sig.get("home_missing_star") else 0) + (1 if sig.get("away_missing_star") else 0)
     if stars_out:
         star_adj = -stars_out * 5
         adj += star_adj
-        reasons.append(f"Star attacker(s) missing ({star_adj})")
+        reasons.append(f"Star attacker(s) missing — expect fewer goals")
 
     # ── H2H goals history ──
     if "h2h_results" in sig and len(sig["h2h_results"]) >= 3:
@@ -795,7 +794,7 @@ def _apply_goals_signals(sig: dict, threshold: float, reasons: list) -> float:
         h2h_adj = max(-8, min(8, h2h_excess * 5))
         adj += h2h_adj
         if abs(h2h_adj) >= 3:
-            reasons.append(f"H2H avg goals: {h2h_avg:.1f} ({'+' if h2h_adj > 0 else ''}{h2h_adj:.0f})")
+            reasons.append(f"These teams average {h2h_avg:.1f} goals when they meet")
 
     return adj
 
@@ -832,15 +831,15 @@ def cross_check_with_odds(confidence: int, implied_odds: float) -> dict:
         # Model is much more confident than the market — trust market partially
         adjusted = int(confidence * 0.7 + implied_prob * 0.3)
         warning = (
-            f"⚠ Our analysis says {confidence}% but market odds imply {implied_prob:.0f}% "
-            f"→ adjusted to {adjusted}% (market may know something we don't)"
+            f"⚠ Our model says {confidence}% but the bookies price it at {implied_prob:.0f}% "
+            f"— adjusted to {adjusted}%. The market may know something we don't."
         )
     elif divergence < -20:
         # Market more confident — potential value bet
         adjusted = int(confidence * 0.7 + implied_prob * 0.3)
         warning = (
-            f"💡 Market odds imply {implied_prob:.0f}% vs our {confidence}% "
-            f"→ adjusted to {adjusted}% (possible value)"
+            f"💡 Bookies rate this at {implied_prob:.0f}% vs our {confidence}% "
+            f"— adjusted to {adjusted}%. Could be value here."
         )
 
     adjusted = max(0, min(95, adjusted))

@@ -177,7 +177,7 @@ def add_thin_data_safe_picks(
             "confidence": conf,
             "data_confidence": conf,
             "verdict": "moderate" if conf >= 52 else "weak",
-            "analysis_reasons": [f"Thin-data fallback driven by strong market price: {odds:.2f}"],
+            "analysis_reasons": [f"Limited match data available — this pick is based on the strong market odds ({odds:.2f}) rather than form analysis"],
             "suggestion": None,
             "data_quality": "limited",
             "rating": "safe",
