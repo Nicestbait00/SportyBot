@@ -177,6 +177,28 @@ def _mark_job_finish(
         state["last_error"] = f"{type(error).__name__}: {error}"
 
 
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+
+_RATE_LIMITS = {
+    "pick": 10,     # seconds
+    "check": 10,
+    "refresh": 60,
+}
+
+
+def _check_rate_limit(context: ContextTypes.DEFAULT_TYPE, command: str) -> str | None:
+    """Return a user-facing message if rate-limited, else None (allowed)."""
+    cooldown = _RATE_LIMITS.get(command, 10)
+    ts_key = f"_rl_{command}"
+    now = time.time()
+    last = context.user_data.get(ts_key, 0)
+    remaining = cooldown - (now - last)
+    if remaining > 0:
+        return f"Please wait {int(remaining)}s before using /{command} again."
+    context.user_data[ts_key] = now
+    return None
+
+
 def _team_results_cache_key(team_name: str, count: int) -> str:
     """Stable key for per-run team results caching."""
     return f"{team_name.strip().lower()}::{count}"
@@ -950,6 +972,10 @@ async def callback_league_toggle(update: Update, context: ContextTypes.DEFAULT_T
 
 async def pick_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the guided /pick flow."""
+    rl_msg = _check_rate_limit(context, "pick")
+    if rl_msg:
+        await update.message.reply_text(rl_msg)
+        return ConversationHandler.END
     _clear_pick_runtime(context)
     context.user_data["chat_id"] = update.effective_chat.id
     args = context.args or []
@@ -1128,9 +1154,14 @@ async def _pick_analyze_from_message(message, context, target: float):
                 pass
 
         if cached_scored:
+            import time as _time2
+            cache_age_min = int((_time2.time() - cdata.get("_ts", 0)) / 60)
+            stale_note = ""
+            if cache_age_min > 60:
+                stale_note = f"\n⏳ Cached {cache_age_min}m ago — odds may have shifted. Use /refresh to re-analyze."
             await message.reply_text(
                 f"⚡ Using cached analysis ({len(cached_scored)} scored picks).\n"
-                f"Target: ~{target:.0f} odds",
+                f"Target: ~{target:.0f} odds{stale_note}",
             )
             context.user_data["pick_all_scored"] = cached_scored
             context.user_data["pick_excluded"] = set()
@@ -1173,7 +1204,10 @@ async def _pick_analyze_from_message(message, context, target: float):
 
         if not all_sporty_events:
             await message.reply_text(
-                "Could not fetch fixtures from SportyBet.",
+                "Could not fetch fixtures from SportyBet.\n"
+                "This usually means the SportyBet API is temporarily down.\n\n"
+                f"Leagues tried: {league_display}\n"
+                "Try /refresh in a few minutes, or check if sportybet.com is accessible.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Retry", callback_data=f"pick_target_{target}")],
                 ]),
@@ -1244,8 +1278,14 @@ async def _pick_analyze_from_message(message, context, target: float):
                 logger.warning(f"Error analyzing {home_name} vs {away_name}: {e}")
 
         if not all_scored:
+            pick_cfg = _get_pick_config(config)
             await message.reply_text(
-                "Could not analyze any fixtures.",
+                f"No picks passed the filters after analyzing {analyzed_count} matches.\n\n"
+                f"Current filters:\n"
+                f"• Min confidence: {pick_cfg.get('min_confidence', 75)}%\n"
+                f"• Min odds: {pick_cfg.get('min_odds', 1.05)}\n"
+                f"• Markets: {len(pick_cfg.get('preferred_markets', []))} enabled\n\n"
+                "Try /strategy to loosen filters, or /leagues to add more leagues.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Retry", callback_data=f"pick_target_{target}")],
                 ]),
@@ -1622,7 +1662,13 @@ async def _pick_build_combo(message, context):
             set(),
         )
         if not picks:
-            await _send_or_edit(message, "Couldn't build a combo from these picks.", edit=False)
+            await _send_or_edit(
+                message,
+                "Couldn't build a combo from these picks.\n"
+                "The code picks may not meet the current confidence/odds filters.\n"
+                "Try /strategy to loosen filters or lower the target odds.",
+                edit=False,
+            )
             return ConversationHandler.END
         ticket = _make_ticket_entry(1, "single", float(context.user_data.get("pick_target", 10)), picks, [])
         context.user_data["pick_combo"] = ticket["picks"]
@@ -1771,14 +1817,14 @@ async def _book_ticket_picks(combo: list[dict]) -> dict:
             if found:
                 sel = await asyncio.to_thread(build_booking_selection, found, p["market"], p["pick"])
             else:
-                failed_bookings.append(f"{p['home']} vs {p['away']}: not found on SportyBet")
+                failed_bookings.append(f"{p['home']} vs {p['away']}: event not found (may have started or been removed)")
                 continue
 
         logger.info(f"  selection: {sel}")
         if sel:
             booking_selections.append(sel)
         else:
-            failed_bookings.append(f"{p['home']} vs {p['away']}: could not build selection")
+            failed_bookings.append(f"{p['home']} vs {p['away']}: market '{p['market']}' unavailable (odds may have changed)")
 
     code = None
     if booking_selections:
@@ -2469,6 +2515,10 @@ async def pick_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Refresh cached data — clears SportyBet event index + analysis cache, re-fetches."""
+    rl_msg = _check_rate_limit(context, "refresh")
+    if rl_msg:
+        await update.message.reply_text(rl_msg)
+        return
     job_token = _mark_job_start(context, "refresh")
     config = load_user_config(chat_id=update.effective_chat.id)
     leagues = config.get("leagues", [])
@@ -2915,6 +2965,10 @@ async def callback_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the check flow. If codes given inline, skip to review."""
+    rl_msg = _check_rate_limit(context, "check")
+    if rl_msg:
+        await update.message.reply_text(rl_msg)
+        return ConversationHandler.END
     context.user_data["chat_id"] = update.effective_chat.id
     args = context.args or []
 
@@ -2980,7 +3034,10 @@ async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
             failed_codes.append(code)
 
     if failed_codes:
-        await update.message.reply_text(f"Could not fetch: {', '.join(failed_codes)}")
+        await update.message.reply_text(
+            f"Could not fetch: {', '.join(failed_codes)}\n"
+            "These codes may be expired, invalid, or the SportyBet API may be down."
+        )
 
     if not all_picks:
         job_success = True

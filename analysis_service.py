@@ -159,10 +159,10 @@ def add_thin_data_safe_picks(
         except (ValueError, TypeError):
             return 0.0
 
-    def _implied_confidence(odds: float, ceiling: int, floor: int = 42) -> int:
+    def _implied_confidence(odds: float, ceiling: int, floor: int = 50) -> int:
         if odds <= 1.0:
             return 0
-        return int(max(floor, min(ceiling, (1 / odds) * 58)))
+        return int(max(floor, min(ceiling, (1 / odds) * 65)))
 
     def _add(market_name: str, pick_label: str, market_key: str, outcome_id: str, odds_cap: float, conf_cap: int):
         odds = _get_market_odds(market_key, outcome_id)
