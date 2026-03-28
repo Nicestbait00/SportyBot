@@ -1436,7 +1436,10 @@ async def _show_pick_bundle_summary(message, context, edit: bool = False):
         lines.append(f"Ticket {ticket['id']}: " + " | ".join(status_bits))
 
     buttons = [
-        [InlineKeyboardButton(f"✏️ Edit Ticket {ticket['id']}", callback_data=f"pick_bundle_edit_{idx}")]
+        [
+            InlineKeyboardButton(f"✏️ Edit Ticket {ticket['id']}", callback_data=f"pick_bundle_edit_{idx}"),
+            InlineKeyboardButton(f"🗑️ Remove", callback_data=f"pick_bundle_delete_{idx}"),
+        ]
         for idx, ticket in enumerate(bundle)
     ]
     buttons.append([
@@ -1955,6 +1958,21 @@ async def pick_review_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         _sync_active_bundle_ticket_from_combo(context)
         context.user_data["pick_bundle_review_mode"] = "bundle"
         return await _show_pick_bundle_summary(query.message, context, edit=True)
+
+    if data.startswith("pick_bundle_delete_"):
+        idx = int(data.replace("pick_bundle_delete_", ""))
+        bundle = context.user_data.get("pick_bundle", [])
+        if 0 <= idx < len(bundle):
+            removed = bundle.pop(idx)
+            # Re-number remaining tickets
+            for i, t in enumerate(bundle):
+                t["id"] = i + 1
+            if not bundle:
+                await query.edit_message_text("All tickets removed. Use /pick to generate new ones.")
+                return ConversationHandler.END
+            await query.edit_message_text(f"🗑️ Ticket removed. {len(bundle)} ticket(s) remaining.")
+            return await _show_pick_bundle_summary(query.message, context, edit=False)
+        return PICK_REVIEW
 
     if data.startswith("pick_bundle_edit_"):
         idx = int(data.replace("pick_bundle_edit_", ""))
