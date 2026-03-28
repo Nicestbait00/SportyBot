@@ -48,6 +48,7 @@ from analyzer import find_best_combo
 from web_analyzer import analyze_pick as web_analyze_pick, get_team_results, _summarize_form, _poisson_over_prob
 from scorer import score_match, cross_check_with_odds
 import gemini_chat
+import chat_agent
 import ticket_engine
 from booking_service import fetch_booking_code, parse_outcomes
 from analysis_service import (
@@ -3804,6 +3805,7 @@ async def post_init(application: Application):
         BotCommand("budget", "Check API calls remaining"),
         BotCommand("status", "Current bot config"),
         BotCommand("health", "Runtime health & recent errors"),
+        BotCommand("chat", "Chat with the AI analyst"),
     ]
     await application.bot.set_my_commands(commands)
     logger.info("Bot command menu registered.")
@@ -3957,9 +3959,43 @@ async def handle_natural_language(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
     else:
-        # intent == "chat" or unknown
-        await update.message.reply_text(reply)
+        # intent == "chat" or unknown — route to agent for richer response
+        chat_id = update.effective_chat.id
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        try:
+            response = await chat_agent.agent_respond(user_text, context.user_data, chat_id)
+            await send_long_message(update, response)
+        except Exception as e:
+            logger.warning(f"Agent error: {e}")
+            await update.message.reply_text(reply)  # fall back to Gemini's short reply
         return ConversationHandler.END
+
+
+async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /chat command — explicit agent mode."""
+    rl_msg = _check_rate_limit(context, "pick")
+    if rl_msg:
+        await update.message.reply_text(rl_msg)
+        return
+    user_text = update.message.text
+    if user_text.startswith("/chat"):
+        user_text = user_text[5:].strip()
+    if not user_text:
+        await update.message.reply_text(
+            "Hey! Ask me anything about football or betting.\n"
+            "I can analyze matches, build tickets, check codes, and more.\n\n"
+            "Try: /chat what matches are on today?"
+        )
+        return
+    chat_id = update.effective_chat.id
+    context.user_data["chat_id"] = chat_id
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        response = await chat_agent.agent_respond(user_text, context.user_data, chat_id)
+        await send_long_message(update, response)
+    except Exception as e:
+        logger.warning(f"Chat agent error: {e}")
+        await update.message.reply_text("I hit a snag processing that. Try again in a moment.")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -4057,6 +4093,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("timeframe", cmd_timeframe))
+    app.add_handler(CommandHandler("chat", cmd_chat))
     app.add_error_handler(error_handler)
 
     # Strategy/settings conversation handler
