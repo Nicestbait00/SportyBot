@@ -101,14 +101,24 @@ LEAGUE_DISPLAY_NAMES: dict[int, str] = {
 
 LEAGUE_CATEGORIES: dict[str, dict] = {
     "A": {
-        "label": "Category A",
-        "description": "Top 5 leagues",
+        "label": "Top 5 Leagues",
+        "description": "Premier League, La Liga, Serie A, Bundesliga, Ligue 1",
         "league_ids": [39, 140, 135, 78, 61],
     },
     "B": {
-        "label": "Category B",
+        "label": "Secondary Leagues",
         "description": "Championship, Primeira Liga, Saudi Pro League, Eredivisie, A-League",
         "league_ids": [40, 94, 307, 88, 188],
+    },
+    "C": {
+        "label": "Club Competitions",
+        "description": "Champions League, Europa League",
+        "league_ids": [2, 3],
+    },
+    "D": {
+        "label": "International",
+        "description": "World Cup, WC Qualifiers, AFCON, Nations League, Friendlies",
+        "league_ids": [1, 5, 6, 10, 29, 30, 31, 32, 36],
     },
 }
 
@@ -231,6 +241,59 @@ AVAILABLE_MARKETS: dict[str, dict] = {
         "description": "Exact final score",
         "outcomes": {},
     },
+    # ── Conditional OR: Result OR Goals ──
+    "Home Or Over": {
+        "sportybet_id": "854",
+        "description": "Home win OR Over 2.5 goals — two ways to win",
+        "outcomes": {"74": "Yes", "76": "No"},
+        "specifier": True,
+    },
+    "Home Or Under": {
+        "sportybet_id": "855",
+        "description": "Home win OR Under 2.5 goals — two ways to win",
+        "outcomes": {"74": "Yes", "76": "No"},
+        "specifier": True,
+    },
+    "Draw Or Over": {
+        "sportybet_id": "856",
+        "description": "Draw OR Over 2.5 goals — two ways to win",
+        "outcomes": {"74": "Yes", "76": "No"},
+        "specifier": True,
+    },
+    "Draw Or Under": {
+        "sportybet_id": "857",
+        "description": "Draw OR Under 2.5 goals — two ways to win",
+        "outcomes": {"74": "Yes", "76": "No"},
+        "specifier": True,
+    },
+    "Away Or Over": {
+        "sportybet_id": "858",
+        "description": "Away win OR Over 2.5 goals — two ways to win",
+        "outcomes": {"74": "Yes", "76": "No"},
+        "specifier": True,
+    },
+    "Away Or Under": {
+        "sportybet_id": "859",
+        "description": "Away win OR Under 2.5 goals — two ways to win",
+        "outcomes": {"74": "Yes", "76": "No"},
+        "specifier": True,
+    },
+    # ── Conditional OR: Result OR GG/NG ──
+    "Home Or GG": {
+        "sportybet_id": "860",
+        "description": "Home win OR Both teams score — two ways to win",
+        "outcomes": {"74": "Yes", "76": "No"},
+    },
+    "Draw Or GG": {
+        "sportybet_id": "861",
+        "description": "Draw OR Both teams score — two ways to win",
+        "outcomes": {"74": "Yes", "76": "No"},
+    },
+    "Away Or GG": {
+        "sportybet_id": "862",
+        "description": "Away win OR Both teams score — two ways to win",
+        "outcomes": {"74": "Yes", "76": "No"},
+    },
 }
 
 # ── Market categories for cross-ticket hedging ────────────────────────────
@@ -239,6 +302,8 @@ MARKET_CATEGORIES = {
               "Over/Under & GG/NG", "1X2 & Over/Under", "Exact Goals"],
     "result": ["1X2", "Double Chance", "Draw No Bet", "1X2 & GG/NG"],
     "halftime": ["HT 1X2", "HT/FT", "HT Over/Under", "HT GG/NG"],
+    "conditional": ["Home Or Over", "Home Or Under", "Draw Or Over", "Draw Or Under",
+                     "Away Or Over", "Away Or Under", "Home Or GG", "Draw Or GG", "Away Or GG"],
     "other": ["Odd/Even", "Home Clean Sheet", "Away Clean Sheet",
               "Handicap", "Correct Score"],
 }
@@ -320,27 +385,30 @@ STRATEGY_PRESETS: dict[str, dict] = {
 # Maps our league IDs to EXACT SportyBet tournament names (case-insensitive)
 # Use exact names from SportyBet API, not substrings, to avoid false matches
 LEAGUE_SPORTYBET_NAMES: dict[int, list[str]] = {
-    39: ["premier league"],
-    40: ["efl championship", "championship"],
-    140: ["laliga"],
-    135: ["serie a"],
-    94: ["primeira liga", "liga portugal"],
+    # ── Domestic leagues ──
+    39: ["premier league", "english premier league"],
+    40: ["efl championship", "championship", "english championship"],
+    140: ["laliga", "la liga", "laliga santander", "laliga ea sports"],
+    135: ["serie a", "italian serie a"],
+    94: ["primeira liga", "liga portugal", "liga portugal betclic"],
     78: ["bundesliga"],
     88: ["eredivisie"],
-    61: ["ligue 1"],
-    307: ["saudi professional league", "saudi pro league"],
-    188: ["australia a-league", "a-league"],
-    2: ["uefa champions league"],
-    3: ["uefa europa league"],
-    5: ["uefa nations league"],
-    6: ["africa cup of nations qualification"],
-    36: ["africa cup of nations qualification"],
-    1: ["fifa world cup"],
-    29: ["fifa world cup qualification"],
-    32: ["fifa world cup qualification, uefa"],
-    30: ["fifa world cup qualification"],
-    31: ["fifa world cup qualification"],
-    10: ["int. friendly games", "fifa series", "international friendly", "international friendlies", "friendly international"],
+    61: ["ligue 1", "ligue 1 uber eats", "ligue 1 mcdonald's"],
+    307: ["saudi professional league", "saudi pro league", "roshn saudi league"],
+    188: ["australia a-league", "a-league", "a-league men"],
+    # ── International club competitions ──
+    2: ["uefa champions league", "champions league"],
+    3: ["uefa europa league", "europa league"],
+    # ── International national team ──
+    5: ["uefa nations league", "nations league"],
+    6: ["africa cup of nations qualification", "africa cup of nations", "afcon qualification", "afcon qualifiers"],
+    36: ["africa cup of nations qualification", "afcon qualification", "afcon qualifiers"],
+    1: ["fifa world cup", "world cup"],
+    29: ["fifa world cup qualification", "world cup qualification, africa", "world cup qualifiers, africa"],
+    32: ["fifa world cup qualification, uefa", "world cup qualification, europe", "world cup qualifiers, europe"],
+    30: ["fifa world cup qualification", "world cup qualification, asia", "world cup qualifiers, asia"],
+    31: ["fifa world cup qualification", "world cup qualification, south america", "world cup qualifiers, south america"],
+    10: ["int. friendly games", "fifa series", "international friendly", "international friendlies", "friendly international", "int. friendly"],
 }
 
 

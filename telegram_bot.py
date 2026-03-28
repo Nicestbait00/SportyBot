@@ -38,9 +38,7 @@ from config import (
     LEAGUE_CATEGORIES,
     LEAGUE_NAMES,
     LEAGUES,
-    MARKET_CATEGORIES,
     STRATEGY_PRESETS,
-    get_market_category,
     load_user_config,
     save_user_config,
 )
@@ -711,6 +709,19 @@ def _add_extended_picks(
         mkt_key = f"20|total={threshold}"
         _add("Away Over/Under", f"Over (total={threshold})", f"away_over_{threshold}", mkt_key, "12")
 
+    # ── Conditional OR: Result OR Over/Under (markets 854-859) ──
+    _add("Home Or Over", "Yes", "home_or_over_2.5", "854|total=2.5", "74")
+    _add("Home Or Under", "Yes", "home_or_under_2.5", "855|total=2.5", "74")
+    _add("Draw Or Over", "Yes", "draw_or_over_2.5", "856|total=2.5", "74")
+    _add("Draw Or Under", "Yes", "draw_or_under_2.5", "857|total=2.5", "74")
+    _add("Away Or Over", "Yes", "away_or_over_2.5", "858|total=2.5", "74")
+    _add("Away Or Under", "Yes", "away_or_under_2.5", "859|total=2.5", "74")
+
+    # ── Conditional OR: Result OR GG (markets 860-862) ──
+    _add("Home Or GG", "Yes", "home_or_gg", "860", "74")
+    _add("Draw Or GG", "Yes", "draw_or_gg", "861", "74")
+    _add("Away Or GG", "Yes", "away_or_gg", "862", "74")
+
 
 def _add_thin_data_safe_picks(
     all_scored: list[dict],
@@ -757,6 +768,12 @@ def _add_thin_data_safe_picks(
     _add("Away Over/Under", "Over (total=0.5)", "20|total=0.5", "12", 1.45, 58)
     _add("Double Chance", "1X", "10", "9", 1.38, 56)
     _add("Double Chance", "X2", "10", "11", 1.38, 56)
+    # Conditional OR — two ways to win, safe at low odds
+    _add("Home Or Over", "Yes", "854|total=2.5", "74", 1.50, 58)
+    _add("Away Or Over", "Yes", "858|total=2.5", "74", 1.85, 56)
+    _add("Home Or GG", "Yes", "860", "74", 1.40, 58)
+    _add("Draw Or Over", "Yes", "856|total=2.5", "74", 1.65, 56)
+    _add("Away Or GG", "Yes", "862", "74", 1.95, 54)
 
 
 # ── Config helpers ────────────────────────────────────────────────────────────
@@ -821,6 +838,9 @@ def _build_league_keyboard(active: set[int]) -> InlineKeyboardMarkup:
                 callback_data=f"league_cat_{key}",
             )
         )
+        if len(category_row) == 2:
+            buttons.append(category_row)
+            category_row = []
     if category_row:
         buttons.append(category_row)
 
@@ -1719,6 +1739,9 @@ def _is_thin_data_safe_pick(p: dict) -> bool:
         return True
     if market == "Double Chance" and p.get("pick") in {"1X", "X2"}:
         return True
+    # Conditional OR markets are inherently safe — two ways to win
+    if market.endswith("Or Over") or market.endswith("Or Under") or market.endswith("Or GG"):
+        return True
     return False
 
 
@@ -1745,6 +1768,9 @@ def _pick_selection_score(p: dict) -> float:
         bonus += 4.5
     elif market == "Draw No Bet":
         bonus += 2.0
+    elif market.endswith("Or Over") or market.endswith("Or Under") or market.endswith("Or GG"):
+        # Conditional OR markets — two ways to win, inherently safer
+        bonus += 10.0
 
     if p.get("rating") == "safe":
         bonus += 1.5
@@ -1778,6 +1804,9 @@ def _pick_qualifies_for_combo(p: dict, min_confidence: int, min_pick_odds: float
             return conf >= max(52, min_confidence - 14)
         if market == "Double Chance" and odds <= 1.38:
             return conf >= max(50, min_confidence - 15)
+        # Conditional OR — two ways to win, safe at low odds
+        if (market.endswith("Or Over") or market.endswith("Or Under") or market.endswith("Or GG")) and odds <= 1.50:
+            return conf >= max(50, min_confidence - 18)
         return False
 
     if conf >= min_confidence:
@@ -1969,29 +1998,19 @@ def _select_ticket_from_pool(
     target: float,
     market_slots: list[dict] | None = None,
     disallowed_match_keys: set[str] | None = None,
-    penalize_categories: set[str] | None = None,
+    disallowed_pick_keys: set[str] | None = None,
 ) -> list[dict]:
-    """Build one ticket from a qualified pool using the existing greedy selector.
+    """Build one ticket from a qualified pool using the greedy selector.
 
-    penalize_categories: market categories used heavily by previous tickets.
-    Picks from these categories get a score penalty to encourage hedging.
+    disallowed_match_keys: match keys (fixtures) to skip entirely.
+    disallowed_pick_keys: specific pick keys to skip (allows same fixture, different market).
     """
     disallowed_match_keys = disallowed_match_keys or set()
-    penalize_categories = penalize_categories or set()
-
-    def _hedged_score(p: dict) -> float:
-        base = _pick_selection_score(p)
-        if penalize_categories and get_market_category(p.get("market", "")) in penalize_categories:
-            base -= 15  # Significant penalty to push picks from other categories up
-        return base
+    disallowed_pick_keys = disallowed_pick_keys or set()
 
     selected = []
     used_matches = set()
     current_odds = 1.0
-
-    # Re-sort with hedging penalty if active
-    if penalize_categories:
-        qualified = sorted(qualified, key=_hedged_score, reverse=True)
 
     if market_slots:
         for slot in market_slots:
@@ -2006,6 +2025,7 @@ def _select_ticket_from_pool(
                 if p["market"] == slot_market
                 and _match_key(p) not in used_matches
                 and _match_key(p) not in disallowed_match_keys
+                and _pick_key(p) not in disallowed_pick_keys
             ]
             if slot_market == "Over/Under" and slot_threshold is not None:
                 slot_picks = [p for p in slot_picks if _pick_threshold(p) == slot_threshold]
@@ -2025,6 +2045,7 @@ def _select_ticket_from_pool(
                 if p["market"] == fill_slot["market"]
                 and _match_key(p) not in used_matches
                 and _match_key(p) not in disallowed_match_keys
+                and _pick_key(p) not in disallowed_pick_keys
             ]
             if fill_slot["market"] == "Over/Under" and fill_slot.get("threshold") is not None:
                 fill_picks = [p for p in fill_picks if _pick_threshold(p) == fill_slot["threshold"]]
@@ -2051,6 +2072,9 @@ def _select_ticket_from_pool(
             return 2
         if market in {"Double Chance", "Draw No Bet"}:
             return 2
+        # Conditional OR — allow 2 per market type (they're diverse by nature)
+        if market.endswith("Or Over") or market.endswith("Or Under") or market.endswith("Or GG"):
+            return 2
         return 1
 
     for pick in qualified:
@@ -2058,6 +2082,8 @@ def _select_ticket_from_pool(
             break
         match_key = _match_key(pick)
         if match_key in used_matches or match_key in disallowed_match_keys:
+            continue
+        if _pick_key(pick) in disallowed_pick_keys:
             continue
         league = pick.get("league", "")
         if league_counts.get(league, 0) >= max_per_league:
@@ -2079,6 +2105,8 @@ def _select_ticket_from_pool(
             match_key = _match_key(pick)
             if match_key in used_matches or match_key in disallowed_match_keys:
                 continue
+            if _pick_key(pick) in disallowed_pick_keys:
+                continue
             league = pick.get("league", "")
             if league_counts.get(league, 0) >= max_per_league + 1:
                 continue
@@ -2097,13 +2125,8 @@ def _select_unique_ticket_from_pool(
     reference_picks: list[dict],
     target: float,
     forbidden_pick_keys: set[str],
-    penalize_categories: set[str] | None = None,
 ) -> list[dict]:
-    """Build a unique ticket on the same fixtures using different markets.
-
-    penalize_categories: categories to deprioritize for cross-ticket hedging.
-    """
-    penalize_categories = penalize_categories or set()
+    """Build a unique ticket on the same fixtures using different markets."""
     forced_match_keys = [_match_key(p) for p in reference_picks]
     ref_by_match = {_match_key(p): p for p in reference_picks}
     by_match: dict[str, list[dict]] = {}
@@ -2116,13 +2139,11 @@ def _select_unique_ticket_from_pool(
 
     selected: list[dict] = []
     candidate_lists: dict[str, list[dict]] = {}
+    skipped_matches: set[str] = set()
     for match_key in forced_match_keys:
         ref_pick = ref_by_match[match_key]
         def _unique_score(p, ref=ref_pick):
-            score = _pick_selection_score(p) - abs(float(p.get("odds", 1.0)) - float(ref.get("odds", 1.0))) * 15
-            if penalize_categories and get_market_category(p.get("market", "")) in penalize_categories:
-                score -= 15
-            return score
+            return _pick_selection_score(p) - abs(float(p.get("odds", 1.0)) - float(ref.get("odds", 1.0))) * 15
 
         candidates = sorted(
             by_match.get(match_key, []),
@@ -2130,9 +2151,14 @@ def _select_unique_ticket_from_pool(
             reverse=True,
         )
         if not candidates:
-            return []
+            # Skip this game instead of killing the whole ticket
+            skipped_matches.add(match_key)
+            continue
         selected.append(candidates[0])
         candidate_lists[match_key] = candidates
+
+    if not selected:
+        return []
 
     current_odds, _ = _ticket_totals(selected)
     if current_odds >= target:
@@ -2187,23 +2213,15 @@ def _generate_dynamic_bundle(
     for profile in profiles:
         bundle = []
         used_match_keys: set[str] = set()
-        prev_ticket_categories: set[str] = set()
         qualified = _build_qualified_pool(all_scored, excluded, profile, market_slots, shuffle_seed)
         for ticket_id in range(1, ticket_count + 1):
             picks = _select_ticket_from_pool(
                 qualified, target, market_slots, used_match_keys,
-                penalize_categories=prev_ticket_categories if ticket_id > 1 else None,
             )
             if not picks:
                 break
             bundle.append(_make_ticket_entry(ticket_id, "dynamic", target, picks, profile.get("notes", [])))
             used_match_keys.update({_match_key(p) for p in picks})
-            # Collect dominant categories from this ticket for hedging the next one
-            from collections import Counter
-            cat_counts = Counter(get_market_category(p.get("market", "")) for p in picks)
-            # Penalize categories that made up >40% of the ticket
-            threshold = max(1, len(picks) * 0.4)
-            prev_ticket_categories = {cat for cat, cnt in cat_counts.items() if cnt >= threshold}
         if len(bundle) > len(best_bundle):
             best_bundle = bundle
             best_profile = profile
@@ -2213,6 +2231,7 @@ def _generate_dynamic_bundle(
     if not best_bundle or best_profile is None:
         return best_bundle, best_profile, False
 
+    # Reuse fallback: when pool is exhausted, reuse fixtures but with different markets
     reuse_bundle = [
         _make_ticket_entry(
             ticket["id"],
@@ -2225,13 +2244,25 @@ def _generate_dynamic_bundle(
         )
         for ticket in best_bundle
     ]
+    # Collect all pick keys used so far — reuse tickets get same fixtures but different picks
+    used_pick_keys: set[str] = set()
+    for ticket in best_bundle:
+        used_pick_keys.update({_pick_key(p) for p in ticket["picks"]})
     qualified = _build_qualified_pool(all_scored, excluded, best_profile, market_slots, shuffle_seed)
     for ticket_id in range(len(reuse_bundle) + 1, ticket_count + 1):
-        picks = _select_ticket_from_pool(qualified, target, market_slots, set())
+        picks = _select_ticket_from_pool(
+            qualified, target, market_slots,
+            disallowed_match_keys=set(),
+            disallowed_pick_keys=used_pick_keys,
+        )
+        if not picks:
+            # Last resort: allow any picks (full reuse)
+            picks = _select_ticket_from_pool(qualified, target, market_slots, set())
         if not picks:
             break
         notes = list(best_profile.get("notes", [])) + ["Reused fixtures after pool exhaustion"]
         reuse_bundle.append(_make_ticket_entry(ticket_id, "dynamic", target, picks, notes, reused_fixtures=True))
+        used_pick_keys.update({_pick_key(p) for p in picks})
 
     if len(reuse_bundle) > len(best_bundle):
         return reuse_bundle, best_profile, True
@@ -2260,25 +2291,14 @@ def _generate_unique_bundle(
         bundle = [_make_ticket_entry(1, "unique", target, base_picks, profile.get("notes", []))]
         used_pick_keys = {_pick_key(p) for p in base_picks}
 
-        # Collect base ticket's dominant categories for hedging
-        from collections import Counter
-        base_cat_counts = Counter(get_market_category(p.get("market", "")) for p in base_picks)
-        base_threshold = max(1, len(base_picks) * 0.4)
-        prev_categories = {cat for cat, cnt in base_cat_counts.items() if cnt >= base_threshold}
-
         for ticket_id in range(2, ticket_count + 1):
             picks = _select_unique_ticket_from_pool(
                 qualified, base_picks, target, used_pick_keys,
-                penalize_categories=prev_categories,
             )
             if not picks:
                 break
             bundle.append(_make_ticket_entry(ticket_id, "unique", target, picks, profile.get("notes", [])))
             used_pick_keys.update({_pick_key(p) for p in picks})
-            # Update categories for next ticket
-            cat_counts = Counter(get_market_category(p.get("market", "")) for p in picks)
-            threshold = max(1, len(picks) * 0.4)
-            prev_categories = {cat for cat, cnt in cat_counts.items() if cnt >= threshold}
 
         if len(bundle) > len(best_bundle):
             best_bundle = bundle
@@ -2820,6 +2840,8 @@ async def _show_pick_change_options(message, context, idx: int, edit: bool = Fal
         elif market == "HT Over/Under":
             threshold = _pick_threshold(alt)
             label = f"HT Over {threshold}" if threshold else f"HT {pick_str}"
+        elif market.endswith("Or Over") or market.endswith("Or Under") or market.endswith("Or GG"):
+            label = f"{market} ({pick_str})"
         else:
             label = f"{market}: {pick_str}"
 

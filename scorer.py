@@ -101,6 +101,16 @@ def score_match(
         "home_over_1.5": _score_team_over(home_form, home_results, 1.5, "home"),
         "away_over_0.5": _score_team_over(away_form, away_results, 0.5, "away"),
         "away_over_1.5": _score_team_over(away_form, away_results, 1.5, "away"),
+        # Conditional OR markets — two ways to win
+        "home_or_over_2.5": _score_conditional_or(hw, over_25, "Home Or Over 2.5"),
+        "home_or_under_2.5": _score_conditional_or(hw, {"confidence": 100 - over_25["confidence"], "reasons": ["Under 2.5"]}, "Home Or Under 2.5"),
+        "draw_or_over_2.5": _score_conditional_or(_score_draw(home_form, away_form, home_results, away_results, sig), over_25, "Draw Or Over 2.5"),
+        "draw_or_under_2.5": _score_conditional_or(_score_draw(home_form, away_form, home_results, away_results, sig), {"confidence": 100 - over_25["confidence"], "reasons": ["Under 2.5"]}, "Draw Or Under 2.5"),
+        "away_or_over_2.5": _score_conditional_or(aw, over_25, "Away Or Over 2.5"),
+        "away_or_under_2.5": _score_conditional_or(aw, {"confidence": 100 - over_25["confidence"], "reasons": ["Under 2.5"]}, "Away Or Under 2.5"),
+        "home_or_gg": _score_conditional_or(hw, btts, "Home Or GG"),
+        "draw_or_gg": _score_conditional_or(_score_draw(home_form, away_form, home_results, away_results, sig), btts, "Draw Or GG"),
+        "away_or_gg": _score_conditional_or(aw, btts, "Away Or GG"),
     }
 
 
@@ -659,6 +669,23 @@ def _score_combo_neg(win_score: dict, neg_score: dict, label: str) -> dict:
     combined = prob_a * prob_b_neg
     conf = int(min(90, combined * 100))
     reasons = [f"{label}: {win_score['confidence']}% × {100 - neg_score['confidence']}% = {conf}%"]
+    return {"confidence": conf, "reasons": reasons}
+
+
+def _score_conditional_or(score_a: dict, score_b: dict, label: str) -> dict:
+    """Score a conditional OR market — bet wins if EITHER condition hits.
+
+    P(A or B) = P(A) + P(B) - P(A and B)
+    Two ways to win → higher confidence than individual bets, lower odds.
+    """
+    prob_a = score_a["confidence"] / 100
+    prob_b = score_b["confidence"] / 100
+    # P(A or B) using inclusion-exclusion
+    combined = prob_a + prob_b - (prob_a * prob_b)
+    conf = int(min(95, combined * 100))
+    reasons = [f"{label}: {score_a['confidence']}% or {score_b['confidence']}% → {conf}%"]
+    reasons.extend(score_a["reasons"][:1])
+    reasons.extend(score_b["reasons"][:1])
     return {"confidence": conf, "reasons": reasons}
 
 

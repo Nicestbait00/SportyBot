@@ -102,9 +102,9 @@ def fetch_all_events(
     Fetch all upcoming football events from SportyBet.
     Returns a flat list of event dicts with team names, IDs, markets, and odds.
 
-    allowed_tournaments: optional list of tournament name substrings.
-        When provided, only events whose tournament name contains one of the
-        substrings (case-insensitive) are included.
+    allowed_tournaments: optional list of exact tournament names.
+        When provided, only events whose tournament name exactly matches one
+        of the entries (case-insensitive) are included.
     """
     # Pre-lowercase the filter strings once for fast comparison
     _filters = [s.lower() for s in allowed_tournaments] if allowed_tournaments else None
@@ -118,7 +118,7 @@ def fetch_all_events(
                 SPORTYBET_API,
                 params={
                     "sportId": "sr:sport:1",
-                    "marketId": "1,10,11,14,18,19,20,21,26,29,31,32,35,36,37,45,47,60,68,75",
+                    "marketId": "1,10,11,14,18,19,20,21,26,29,31,32,35,36,37,45,47,60,68,75,854,855,856,857,858,859,860,861,862",
                     "pageSize": 100,
                     "pageNum": page,
                 },
@@ -138,10 +138,10 @@ def fetch_all_events(
                 tournament_name = t.get("name", "")
 
                 # Skip entire tournament if it doesn't match the filter
-                # Uses bidirectional substring to handle name variants
+                # Uses exact match — all name variants must be listed in LEAGUE_SPORTYBET_NAMES
                 if _filters:
                     t_lower = tournament_name.lower().strip()
-                    if not any(f in t_lower or t_lower in f for f in _filters):
+                    if not any(f == t_lower for f in _filters):
                         continue
 
                 for e in t.get("events", []):
@@ -719,6 +719,30 @@ def build_booking_selection(event: dict, market_type: str, pick: str) -> Optiona
                 if o.get("name", "").strip() == score_str:
                     return _make("45", oid, "", o.get("odds", "0"))
         return None
+
+    # ── Conditional OR markets (854-862) ──
+    # All use outcome 74 (Yes) / 76 (No), specifier total=X.5 for 854-859
+    _or_market_ids = {
+        "home or over": "854", "home or under": "855",
+        "draw or over": "856", "draw or under": "857",
+        "away or over": "858", "away or under": "859",
+        "home or gg": "860", "draw or gg": "861", "away or gg": "862",
+    }
+    if mt_lower in _or_market_ids:
+        mid = _or_market_ids[mt_lower]
+        pick_lower = pick.lower().strip()
+        outcome_id = "74" if pick_lower == "yes" else "76" if pick_lower == "no" else "74"
+        # For 854-859, need specifier
+        if mid in ("854", "855", "856", "857", "858", "859"):
+            spec = _extract_total_specifier(pick_lower) if "total=" in pick_lower else "total=2.5"
+            market_key = f"{mid}|{spec}"
+        else:
+            market_key = mid
+            spec = ""
+        market = markets.get(market_key, markets.get(mid, {}))
+        outcomes = market.get("outcomes", {})
+        o = outcomes.get(outcome_id, {})
+        return _make(mid, outcome_id, spec, o.get("odds", "0"))
 
     return None
 
