@@ -24,6 +24,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    PicklePersistence,
     filters,
 )
 
@@ -1292,6 +1293,9 @@ async def pick_receive_odds_text(update: Update, context: ContextTypes.DEFAULT_T
     except ValueError:
         await update.message.reply_text("Send a number (e.g. 10) or /cancel.")
         return PICK_ODDS
+    if target < 1.5 or target > 500:
+        await update.message.reply_text("Target odds must be between 1.5 and 500. Try again or /cancel.")
+        return PICK_ODDS
     req = _ensure_pick_request(context)
     req["target_odds"] = target
     context.user_data["pick_request"] = req
@@ -1399,6 +1403,12 @@ async def _pick_analyze_from_message(message, context, target: float):
             f"First run — caching results for instant reshuffles.",
         )
 
+        # Send typing indicator while fetching
+        try:
+            await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
+        except Exception:
+            pass
+
         # Step 1: Get fixtures directly from SportyBet (has event IDs + real odds)
         # Build tournament name filter from user's league config
         from config import LEAGUE_SPORTYBET_NAMES
@@ -1446,7 +1456,14 @@ async def _pick_analyze_from_message(message, context, target: float):
         analyzed_count = 0
         _last_progress = 0
 
-        for ev in sporty_events:
+        for ev_idx, ev in enumerate(sporty_events):
+            # Periodic typing indicator so Telegram doesn't show stale state
+            if ev_idx % 10 == 0:
+                try:
+                    await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
+                except Exception:
+                    pass
+
             home_name = ev["home"]
             away_name = ev["away"]
             event_id = ev["eventId"]
@@ -2341,15 +2358,21 @@ def _generate_pick_bundle(context) -> tuple[list[dict], dict | None, bool]:
 def _build_ticket_review_text(ticket: dict, heading: str | None = None) -> str:
     """Format a single ticket for Telegram review."""
     picks = ticket.get("picks", [])
+    is_reused = ticket.get("reused_fixtures", False)
     lines = [heading or f"🎫 Ticket {ticket.get('id', 1)}"]
     lines.append("")
 
+    has_limited = False
     verdict_icons = {"strong": "🟢", "moderate": "🟡", "weak": "🟠"}
     for idx, pick in enumerate(picks, 1):
         icon = verdict_icons.get(pick.get("verdict", ""), "❓")
+        if pick.get("data_quality") == "limited":
+            icon = "⚠️"
+            has_limited = True
         market_label = pick.get("pick", "").replace("(total=", "").replace(")", "")
         conf = pick.get("data_confidence", pick.get("confidence", "?"))
-        lines.append(f"{icon} {idx}. {pick.get('home')} vs {pick.get('away')}")
+        suffix = " ♻️" if is_reused else ""
+        lines.append(f"{icon} {idx}. {pick.get('home')} vs {pick.get('away')}{suffix}")
         lines.append(f"   {pick.get('market')}: {market_label} @ ~{pick.get('odds', 0):.2f} [{conf}%]")
         reasons = pick.get("analysis_reasons", [])
         if reasons:
@@ -2361,8 +2384,13 @@ def _build_ticket_review_text(ticket: dict, heading: str | None = None) -> str:
     lines.append(f"Avg Confidence: {ticket.get('avg_confidence', 0)}%")
     if ticket.get("fallback_notes"):
         lines.append(f"Fallback: {'; '.join(ticket['fallback_notes'])}")
-    if ticket.get("reused_fixtures"):
-        lines.append("Reuse note: fixtures were reused after pool exhaustion")
+    legend_parts = []
+    if has_limited:
+        legend_parts.append("⚠️ = limited data")
+    if is_reused:
+        legend_parts.append("♻️ = reused fixture (different market)")
+    if legend_parts:
+        lines.append(" | ".join(legend_parts))
     return "\n".join(lines)
 
 
@@ -2383,10 +2411,10 @@ async def _show_pick_bundle_summary(message, context, edit: bool = False):
 
     for ticket in bundle:
         status_bits = [f"~{ticket['total_odds']:.2f} odds", f"{ticket['avg_confidence']}% avg"]
-        if ticket.get("fallback_notes"):
-            status_bits.append("fallback used")
+        if any(p.get("data_quality") == "limited" for p in ticket.get("picks", [])):
+            status_bits.append("⚠️ thin-data picks")
         if ticket.get("reused_fixtures"):
-            status_bits.append("fixtures reused")
+            status_bits.append("♻️ reused fixtures")
         lines.append(f"Ticket {ticket['id']}: " + " | ".join(status_bits))
 
     buttons = [
@@ -2539,14 +2567,21 @@ async def _show_single_ticket_combo(message, context, ticket: dict, edit: bool =
     league_str = ", ".join(_LN.get(lid, str(lid)) for lid in leagues) if leagues else "All"
     timeframe_str = _TP.get(timeframe, {}).get("label", timeframe)
 
+    is_reused = ticket.get("reused_fixtures", False)
     verdict_icons = {"strong": "🟢", "moderate": "🟡", "weak": "🟠"}
     lines = [f"🎯 Picks for ~{target:.0f} odds | {league_str} | {timeframe_str}", ""]
 
+    has_limited = False
     for idx, pick in enumerate(selected, 1):
         icon = verdict_icons.get(pick.get("verdict", ""), "❓")
+        # Flag limited-data picks
+        if pick.get("data_quality") == "limited":
+            icon = "⚠️"
+            has_limited = True
         market_label = pick.get("pick", "").replace("(total=", "").replace(")", "")
         conf = pick.get("data_confidence", pick.get("confidence", 0))
-        lines.append(f"{icon} {idx}. {pick.get('home')} vs {pick.get('away')}")
+        suffix = " ♻️" if is_reused else ""
+        lines.append(f"{icon} {idx}. {pick.get('home')} vs {pick.get('away')}{suffix}")
         lines.append(f"   [{pick.get('league', '')}] {pick.get('market')}: {market_label} @ ~{pick.get('odds', 0):.2f} [{conf}%]")
         reasons = pick.get("analysis_reasons", [])
         if reasons:
@@ -2556,6 +2591,15 @@ async def _show_single_ticket_combo(message, context, ticket: dict, edit: bool =
     lines.append(f"Total Odds: ~{ticket.get('total_odds', 1.0):.2f}")
     lines.append(f"Selections: {len(selected)}")
     lines.append(f"Avg Confidence: {ticket.get('avg_confidence', 0)}%")
+
+    # Legend for special indicators
+    legend_parts = []
+    if has_limited:
+        legend_parts.append("⚠️ = limited data")
+    if is_reused:
+        legend_parts.append("♻️ = reused fixture")
+    if legend_parts:
+        lines.append(" | ".join(legend_parts))
 
     buttons = []
     for idx, _pick in enumerate(selected):
@@ -4491,6 +4535,9 @@ async def check_receive_odds_text(update: Update, context: ContextTypes.DEFAULT_
     except ValueError:
         await update.message.reply_text("Send a number (e.g. 10) or /cancel.")
         return CHECK_TARGET_ODDS
+    if target < 1.5 or target > 500:
+        await update.message.reply_text("Target odds must be between 1.5 and 500. Try again or /cancel.")
+        return CHECK_TARGET_ODDS
 
     context.user_data["check_target"] = target
     return await _check_build_and_show(update.message, context)
@@ -4891,9 +4938,11 @@ def main():
         sys.exit(1)
 
     runtime_mode = _runtime_mode_from_env()
+    persistence = PicklePersistence(filepath="bot_data.pickle")
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
+        .persistence(persistence)
         .concurrent_updates(CONCURRENT_UPDATES)
         .post_init(post_init)
         .build()
@@ -4925,6 +4974,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", check_cancel)],
         allow_reentry=True,
+        conversation_timeout=300,
     )
     app.add_handler(check_conv)
 
@@ -4961,6 +5011,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", pick_cancel)],
         allow_reentry=True,
+        conversation_timeout=300,
     )
     app.add_handler(pick_conv)
 
@@ -5000,6 +5051,7 @@ def main():
         fallbacks=[CommandHandler("cancel", strategy_cancel)],
         allow_reentry=True,
         per_message=False,
+        conversation_timeout=300,
     )
     app.add_handler(strat_conv)
 

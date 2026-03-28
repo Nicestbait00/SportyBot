@@ -3,5 +3,10 @@ __pycache__/
 *.pyc
 .cache/
 bot.log
+bot_data.pickle
 codex-backups/
 node_modules/
+openclaw.config.json
+openclaw.config.json.save
+user_config.json
+.config/
