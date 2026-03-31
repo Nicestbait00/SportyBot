@@ -1585,7 +1585,7 @@ async def _show_single_ticket_combo(message, context, ticket: dict, edit: bool =
 
     chat_id = context.user_data.get("chat_id")
     config = load_user_config(chat_id=chat_id)
-    from config import LEAGUE_NAMES as _LN, TIMEFRAME_PRESETS as _TP
+    from core.config import LEAGUE_NAMES as _LN, TIMEFRAME_PRESETS as _TP
 
     leagues = config.get("leagues", [])
     timeframe = config.get("timeframe", "7days")
