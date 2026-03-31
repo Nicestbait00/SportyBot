@@ -1,8 +1,8 @@
 """
-Gemini conversational layer for SportyBot.
+LLM conversational layer for SportyBot.
 
-Handles intent parsing and natural language conversation.
-Gemini does NOT make pick decisions — only the deterministic scoring engine does that.
+Handles intent parsing and natural language conversation via OpenRouter.
+The LLM does NOT make pick decisions — only the deterministic scoring engine does that.
 """
 
 import json
@@ -14,11 +14,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.0-flash:generateContent"
-)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 
 SYSTEM_PROMPT = """\
 You are SportyBot, a sharp but friendly football betting assistant on Telegram.
@@ -127,347 +125,103 @@ Rules:
 """
 
 
+# ── OpenRouter API call ──────────────────────────────────────────────────────
+
+def _call_openrouter(system_prompt: str, user_text: str) -> str | None:
+    """Call OpenRouter and return raw text response, or None on failure."""
+    if not OPENROUTER_API_KEY:
+        return None
+    body = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 512,
+    }
+    try:
+        resp = requests.post(
+            OPENROUTER_URL,
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+            json=body,
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"OpenRouter error {resp.status_code}: {resp.text[:200]}")
+            return None
+        data = resp.json()
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception as e:
+        logger.warning(f"OpenRouter call failed: {e}")
+        return None
+
+
+def _parse_json_response(text: str, allowed_intents: set, default_intent: str = "chat") -> dict:
+    """Parse raw LLM text into intent/params/reply dict."""
+    if not text:
+        return {"intent": default_intent, "params": {}, "reply": ""}
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    text = text.strip()
+
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning(f"LLM returned non-JSON: {text[:200]}")
+        return {
+            "intent": default_intent,
+            "params": {},
+            "reply": text[:500] if text else "",
+        }
+
+    if "intent" not in result:
+        result["intent"] = default_intent
+    if "params" not in result:
+        result["params"] = {}
+    if "reply" not in result:
+        result["reply"] = ""
+
+    if result["intent"] not in allowed_intents:
+        result["intent"] = default_intent
+
+    return result
+
+
+# ── Public API ───────────────────────────────────────────────────────────────
+
 def chat(message: str, context: dict = None) -> dict:
     """
-    Send a message to Gemini for intent parsing.
+    Parse a user message for intent using OpenRouter.
 
-    Args:
-        message: The user's raw text message.
-        context: Optional dict with user context (active leagues, timeframe, etc.).
-
-    Returns:
-        dict with keys: intent, params, reply
+    Returns dict with keys: intent, params, reply
     """
-    if not GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY not set — falling back to basic parsing")
-        return _fallback_parse(message)
-
-    # Build the user prompt with optional context
     user_text = message
     if context:
         user_text = f"[User context: {json.dumps(context)}]\n\nUser message: {message}"
 
-    body = {
-        "contents": [
-            {"parts": [{"text": user_text}]}
-        ],
-        "systemInstruction": {
-            "parts": [{"text": SYSTEM_PROMPT}]
-        },
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 512,
-        },
-    }
-
-    try:
-        resp = requests.post(
-            GEMINI_URL,
-            params={"key": GEMINI_API_KEY},
-            json=body,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Extract text from Gemini response
-        text = (
-            data.get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [{}])[0]
-            .get("text", "")
-        )
-
-        # Strip markdown code fences if present
-        text = text.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-        text = text.strip()
-
-        result = json.loads(text)
-
-        # Validate required fields
-        if "intent" not in result:
-            result["intent"] = "chat"
-        if "params" not in result:
-            result["params"] = {}
-        if "reply" not in result:
-            result["reply"] = "I'm here to help with football picks!"
-
-        # Validate intent is one of allowed values
-        allowed = {"pick", "check", "leagues", "timeframe", "stats", "chat"}
-        if result["intent"] not in allowed:
-            result["intent"] = "chat"
-
-        return result
-
-    except json.JSONDecodeError:
-        logger.warning(f"Gemini returned non-JSON: {text[:200] if 'text' in dir() else '(no text)'}")
-        return {
-            "intent": "chat",
-            "params": {},
-            "reply": "Sorry, I had trouble understanding that. Try /pick for picks or /check to analyze a code.",
-        }
-    except requests.RequestException as e:
-        logger.warning(f"Gemini API error: {e}")
+    raw = _call_openrouter(SYSTEM_PROMPT, user_text)
+    if not raw:
         return _fallback_parse(message)
-    except Exception as e:
-        logger.warning(f"Gemini chat error: {e}")
-        return _fallback_parse(message)
+
+    return _parse_json_response(
+        raw, {"pick", "check", "leagues", "timeframe", "stats", "chat"}
+    )
 
 
 def parse_review_message(message: str, combo_size: int) -> dict:
-    """
-    Parse a user message during combo review using Gemini.
-
-    Returns dict with keys: intent, params, reply
-    Intent is one of: edit, book, explain, reshuffle, chat
-    """
-    if not GEMINI_API_KEY:
-        return _fallback_review_parse(message, combo_size)
-
+    """Parse a user message during combo review."""
     prompt = REVIEW_PROMPT.format(combo_size=combo_size)
-    user_text = f"User says: {message}"
-
-    body = {
-        "contents": [
-            {"parts": [{"text": user_text}]}
-        ],
-        "systemInstruction": {
-            "parts": [{"text": prompt}]
-        },
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 512,
-        },
-    }
-
-    try:
-        resp = requests.post(
-            GEMINI_URL,
-            params={"key": GEMINI_API_KEY},
-            json=body,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        text = (
-            data.get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [{}])[0]
-            .get("text", "")
-        )
-
-        text = text.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-        text = text.strip()
-
-        result = json.loads(text)
-
-        if "intent" not in result:
-            result["intent"] = "chat"
-        if "params" not in result:
-            result["params"] = {}
-        if "reply" not in result:
-            result["reply"] = ""
-
-        allowed = {"edit", "book", "explain", "reshuffle", "chat"}
-        if result["intent"] not in allowed:
-            result["intent"] = "chat"
-
-        return result
-
-    except json.JSONDecodeError:
-        logger.warning(f"Gemini review parse non-JSON: {text[:200] if 'text' in dir() else '(no text)'}")
-        return _fallback_review_parse(message, combo_size)
-    except Exception as e:
-        logger.warning(f"Gemini review parse error: {e}")
+    raw = _call_openrouter(prompt, f"User says: {message}")
+    if not raw:
         return _fallback_review_parse(message, combo_size)
 
+    return _parse_json_response(
+        raw, {"edit", "book", "explain", "reshuffle", "chat"}
+    )
 
-def _fallback_review_parse(message: str, combo_size: int) -> dict:
-    """Regex fallback for review message parsing."""
-    msg = message.lower().strip()
-
-    # Book intent
-    book_words = ("book", "confirm", "yes", "keep", "lock", "go ahead", "place",
-                  "bet", "lets go", "let's go", "do it", "send it", "cool",
-                  "perfect", "nice", "that works", "looks good", "done", "fire",
-                  "lgtm", "good", "great", "ok", "okay", "sure", "yep", "yeah",
-                  "absolutely", "definitely", "for sure", "ship it", "i'm happy")
-    if msg in book_words or any(msg.startswith(w) for w in ("book ", "confirm ", "yes ")):
-        return {"intent": "book", "params": {}, "reply": ""}
-
-    # Reshuffle intent
-    reshuffle_words = ("reshuffle", "shuffle", "different", "other", "try again",
-                       "new picks", "not feeling", "nah", "nope", "meh",
-                       "give me different", "other options", "change all")
-    if any(w in msg for w in reshuffle_words):
-        return {"intent": "reshuffle", "params": {}, "reply": ""}
-
-    # Explain intent
-    explain_words = ("why", "explain", "tell me more", "break it down", "synopsis",
-                     "how confident", "reasoning", "what makes", "data behind")
-    if any(w in msg for w in explain_words):
-        nums = re.findall(r"\d+", msg)
-        picks = [int(n) for n in nums if 1 <= int(n) <= combo_size]
-        return {"intent": "explain", "params": {"picks": picks}, "reply": ""}
-
-    # Edit intent — check for remove/change patterns
-    if any(w in msg for w in ("remove", "drop", "delete", "exclude", "take out",
-                               "get rid", "change", "swap", "switch", "make")):
-        return {"intent": "edit", "params": {}, "reply": ""}
-
-    return {"intent": "chat", "params": {}, "reply": ""}
-
-
-def _parse_market_slots(msg: str) -> list | None:
-    """Extract market slot distribution from a natural language message.
-
-    Returns list of slot dicts or None if no structured distribution found.
-    """
-    slots = []
-
-    # Pattern: "N win(s)" or "N straight win(s)" → 1X2
-    win_match = re.search(r"(\d+)\s*(?:straight\s+)?win", msg)
-    if win_match:
-        slots.append({"market": "1X2", "count": int(win_match.group(1))})
-
-    # Pattern: "N over X.5" → Over/Under with threshold
-    over_matches = re.finditer(r"(\d+)\s*over\s*(\d+(?:\.\d+)?)", msg)
-    for m in over_matches:
-        slots.append({
-            "market": "Over/Under",
-            "count": int(m.group(1)),
-            "threshold": float(m.group(2)),
-        })
-
-    # Pattern: "N btts" or "N gg" → GG/NG
-    btts_match = re.search(r"(\d+)\s*(?:btts|gg|both\s+teams)", msg)
-    if btts_match:
-        slots.append({"market": "GG/NG", "count": int(btts_match.group(1))})
-
-    # Pattern: "rest over X.5" or "the rest over X.5" → fill slot
-    rest_match = re.search(r"rest\s+(?:over\s*)?(\d+(?:\.\d+)?)", msg)
-    if rest_match:
-        slots.append({
-            "market": "Over/Under",
-            "threshold": float(rest_match.group(1)),
-            "fill": True,
-        })
-
-    # Only return if we found at least 2 different market types or explicit distribution
-    if len(slots) >= 2:
-        return slots
-    return None
-
-
-def _fallback_parse(message: str) -> dict:
-    """Basic keyword-based fallback when Gemini is unavailable."""
-    msg = message.lower().strip()
-
-    # Greetings
-    if msg in ("hi", "hello", "hey", "yo", "sup", "good morning", "good evening"):
-        return {
-            "intent": "chat",
-            "params": {},
-            "reply": "Hey! I'm SportyBot. Ask me for picks, check a booking code, or just chat about football.",
-        }
-
-    # Pick intent
-    odds_match = re.search(r"(\d+(?:\.\d+)?)\s*odds", msg)
-    if odds_match or any(kw in msg for kw in ("pick", "bet", "combo", "find me", "get me")):
-        target = float(odds_match.group(1)) if odds_match else None
-        market = None
-        market_slots = None
-        ticket_type = None
-        ticket_count = None
-        ticket_mode = None
-
-        ticket_count_match = re.search(r"\b([2-5])\s*tickets?\b", msg)
-        if ticket_count_match:
-            ticket_type = "multiple"
-            ticket_count = int(ticket_count_match.group(1))
-        elif "multiple ticket" in msg or "multiple bet" in msg:
-            ticket_type = "multiple"
-        elif "single ticket" in msg:
-            ticket_type = "single"
-
-        if "unique ticket" in msg or "unique bets" in msg:
-            ticket_type = "multiple"
-            ticket_mode = "unique"
-        elif "dynamic ticket" in msg or "different games" in msg:
-            ticket_type = "multiple"
-            ticket_mode = "dynamic"
-
-        # Try to extract market distribution from structured requests
-        slots = _parse_market_slots(msg)
-        if slots:
-            market_slots = slots
-        elif "over" in msg:
-            market = "over_2.5"
-        elif "home" in msg or "win" in msg:
-            market = "1x2"
-
-        return {
-            "intent": "pick",
-            "params": {
-                "target_odds": target,
-                "ticket_type": ticket_type,
-                "ticket_count": ticket_count,
-                "ticket_mode": ticket_mode,
-                "market": market,
-                "market_slots": market_slots,
-            },
-            "reply": f"Looking for picks{' at ' + str(target) + ' odds' if target else ''}...",
-        }
-
-    # Check intent — look for booking code patterns
-    code_match = re.search(r"\b([A-Za-z0-9]{6,10})\b", msg)
-    if "check" in msg or "code" in msg or "analyze" in msg:
-        return {
-            "intent": "check",
-            "params": {"code": code_match.group(1) if code_match else None},
-            "reply": "Let me analyze that for you.",
-        }
-
-    # Stats
-    if any(kw in msg for kw in ("form", "stats", "how is", "how are", "results for")):
-        # Try to extract a team name (everything after the keyword)
-        for kw in ("form of", "stats for", "how is", "how are", "results for", "form"):
-            if kw in msg:
-                team = msg.split(kw, 1)[1].strip().rstrip("?. ")
-                if team:
-                    return {
-                        "intent": "stats",
-                        "params": {"team": team.title()},
-                        "reply": f"Checking {team.title()} form...",
-                    }
-        return {
-            "intent": "chat",
-            "params": {},
-            "reply": "Which team do you want to check? e.g. 'Arsenal form'",
-        }
-
-    # Leagues / timeframe
-    if "league" in msg:
-        return {"intent": "leagues", "params": {}, "reply": "Here are the available leagues."}
-    if any(kw in msg for kw in ("timeframe", "window", "today", "weekend", "time")):
-        return {"intent": "timeframe", "params": {}, "reply": "Let's set your time window."}
-
-    # Default chat
-    return {
-        "intent": "chat",
-        "params": {},
-        "reply": "I'm SportyBot — your football betting assistant. Try asking for picks (e.g. '10 odds') or type /help to see commands.",
-    }
-
-
-# ── Per-game dialogue ────────────────────────────────────────────────────
 
 GAME_DIALOGUE_PROMPT = """\
 You are SportyBot, discussing a specific football match with the user during combo review.
@@ -497,8 +251,7 @@ Respond ONLY with valid JSON:
 
 
 def parse_game_dialogue(message: str, current_pick: dict, alternatives: list[dict]) -> dict:
-    """Parse a user message during per-game dialogue using Gemini."""
-    # Build context strings
+    """Parse a user message during per-game dialogue."""
     current_str = (
         f"{current_pick.get('home', '')} vs {current_pick.get('away', '')}\n"
         f"Market: {current_pick.get('market', '')} | Pick: {current_pick.get('pick', '')} "
@@ -514,70 +267,67 @@ def parse_game_dialogue(message: str, current_pick: dict, alternatives: list[dic
         )
     alt_str = "\n".join(alt_lines) if alt_lines else "No alternatives scored for this match."
 
-    if not GEMINI_API_KEY:
-        return _fallback_game_dialogue(message, alternatives)
-
     prompt = GAME_DIALOGUE_PROMPT.format(current_pick=current_str, alternatives=alt_str)
-
-    body = {
-        "contents": [{"parts": [{"text": f"User says: {message}"}]}],
-        "systemInstruction": {"parts": [{"text": prompt}]},
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 512},
-    }
-
-    try:
-        resp = requests.post(
-            GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        text = (
-            data.get("candidates", [{}])[0]
-            .get("content", {}).get("parts", [{}])[0].get("text", "")
-        )
-        text = text.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-        text = text.strip()
-
-        result = json.loads(text)
-        for key in ("intent", "params", "reply"):
-            if key not in result:
-                result[key] = "chat" if key == "intent" else {} if key == "params" else ""
-
-        allowed = {"compare", "switch", "keep", "chat"}
-        if result["intent"] not in allowed:
-            result["intent"] = "chat"
-        return result
-
-    except Exception as e:
-        logger.warning(f"Gemini game dialogue error: {e}")
+    raw = _call_openrouter(prompt, f"User says: {message}")
+    if not raw:
         return _fallback_game_dialogue(message, alternatives)
+
+    return _parse_json_response(
+        raw, {"compare", "switch", "keep", "chat"}
+    )
+
+
+# ── Fallbacks (keyword-based, no API needed) ────────────────────────────────
+
+def _fallback_review_parse(message: str, combo_size: int) -> dict:
+    """Regex fallback for review message parsing."""
+    msg = message.lower().strip()
+
+    book_words = ("book", "confirm", "yes", "keep", "lock", "go ahead", "place",
+                  "bet", "lets go", "let's go", "do it", "send it", "cool",
+                  "perfect", "nice", "that works", "looks good", "done", "fire",
+                  "lgtm", "good", "great", "ok", "okay", "sure", "yep", "yeah",
+                  "absolutely", "definitely", "for sure", "ship it", "i'm happy")
+    if msg in book_words or any(msg.startswith(w) for w in ("book ", "confirm ", "yes ")):
+        return {"intent": "book", "params": {}, "reply": ""}
+
+    reshuffle_words = ("reshuffle", "shuffle", "different", "other", "try again",
+                       "new picks", "not feeling", "nah", "nope", "meh",
+                       "give me different", "other options", "change all")
+    if any(w in msg for w in reshuffle_words):
+        return {"intent": "reshuffle", "params": {}, "reply": ""}
+
+    explain_words = ("why", "explain", "tell me more", "break it down", "synopsis",
+                     "how confident", "reasoning", "what makes", "data behind")
+    if any(w in msg for w in explain_words):
+        nums = re.findall(r"\d+", msg)
+        picks = [int(n) for n in nums if 1 <= int(n) <= combo_size]
+        return {"intent": "explain", "params": {"picks": picks}, "reply": ""}
+
+    if any(w in msg for w in ("remove", "drop", "delete", "exclude", "take out",
+                               "get rid", "change", "swap", "switch", "make")):
+        return {"intent": "edit", "params": {}, "reply": ""}
+
+    return {"intent": "chat", "params": {}, "reply": ""}
 
 
 def _fallback_game_dialogue(message: str, alternatives: list[dict]) -> dict:
     """Regex fallback for game dialogue parsing."""
     msg = message.lower().strip()
 
-    # Keep
     if any(w in msg for w in ("keep", "leave", "fine", "ok", "good", "nah")):
         return {"intent": "keep", "params": {}, "reply": ""}
 
-    # Switch
     switch_match = re.search(r"(?:switch|change|swap)\s+(?:to\s+)?(.+)", msg)
     if switch_match:
         market = switch_match.group(1).strip()
         return {"intent": "switch", "params": {"market": market, "pick": ""}, "reply": ""}
 
-    # Compare — "what about X", "how does X look"
     compare_match = re.search(r"(?:what about|how about|how does|how is|compare)\s+(.+?)(?:\?|$)", msg)
     if compare_match:
         market = compare_match.group(1).strip()
         return {"intent": "compare", "params": {"market": market}, "reply": ""}
 
-    # Market mention
     for alt in alternatives[:8]:
         alt_market = alt.get("market", "").lower()
         alt_pick = alt.get("pick", "").lower()
@@ -585,3 +335,127 @@ def _fallback_game_dialogue(message: str, alternatives: list[dict]) -> dict:
             return {"intent": "compare", "params": {"market": alt_market}, "reply": ""}
 
     return {"intent": "chat", "params": {}, "reply": ""}
+
+
+def _parse_market_slots(msg: str) -> list | None:
+    """Extract market slot distribution from a natural language message."""
+    slots = []
+
+    win_match = re.search(r"(\d+)\s*(?:straight\s+)?win", msg)
+    if win_match:
+        slots.append({"market": "1X2", "count": int(win_match.group(1))})
+
+    over_matches = re.finditer(r"(\d+)\s*over\s*(\d+(?:\.\d+)?)", msg)
+    for m in over_matches:
+        slots.append({
+            "market": "Over/Under",
+            "count": int(m.group(1)),
+            "threshold": float(m.group(2)),
+        })
+
+    btts_match = re.search(r"(\d+)\s*(?:btts|gg|both\s+teams)", msg)
+    if btts_match:
+        slots.append({"market": "GG/NG", "count": int(btts_match.group(1))})
+
+    rest_match = re.search(r"rest\s+(?:over\s*)?(\d+(?:\.\d+)?)", msg)
+    if rest_match:
+        slots.append({
+            "market": "Over/Under",
+            "threshold": float(rest_match.group(1)),
+            "fill": True,
+        })
+
+    if len(slots) >= 2:
+        return slots
+    return None
+
+
+def _fallback_parse(message: str) -> dict:
+    """Basic keyword-based fallback when API is unavailable."""
+    msg = message.lower().strip()
+
+    if msg in ("hi", "hello", "hey", "yo", "sup", "good morning", "good evening"):
+        return {
+            "intent": "chat",
+            "params": {},
+            "reply": "Hey! I'm SportyBot. Ask me for picks, check a booking code, or just chat about football.",
+        }
+
+    odds_match = re.search(r"(\d+(?:\.\d+)?)\s*odds", msg)
+    if odds_match or any(kw in msg for kw in ("pick", "bet", "combo", "find me", "get me")):
+        target = float(odds_match.group(1)) if odds_match else None
+        market_slots = _parse_market_slots(msg)
+        ticket_type = None
+        ticket_count = None
+        ticket_mode = None
+
+        ticket_count_match = re.search(r"\b([2-5])\s*tickets?\b", msg)
+        if ticket_count_match:
+            ticket_type = "multiple"
+            ticket_count = int(ticket_count_match.group(1))
+        elif "multiple ticket" in msg or "multiple bet" in msg:
+            ticket_type = "multiple"
+        elif "single ticket" in msg:
+            ticket_type = "single"
+
+        if "unique ticket" in msg or "unique bets" in msg:
+            ticket_type = "multiple"
+            ticket_mode = "unique"
+        elif "dynamic ticket" in msg or "different games" in msg:
+            ticket_type = "multiple"
+            ticket_mode = "dynamic"
+
+        market = None
+        if not market_slots:
+            if "over" in msg:
+                market = "over_2.5"
+            elif "home" in msg or "win" in msg:
+                market = "1x2"
+
+        return {
+            "intent": "pick",
+            "params": {
+                "target_odds": target,
+                "ticket_type": ticket_type,
+                "ticket_count": ticket_count,
+                "ticket_mode": ticket_mode,
+                "market": market,
+                "market_slots": market_slots,
+            },
+            "reply": f"Looking for picks{' at ' + str(target) + ' odds' if target else ''}...",
+        }
+
+    code_match = re.search(r"\b([A-Za-z0-9]{6,10})\b", msg)
+    if "check" in msg or "code" in msg or "analyze" in msg:
+        return {
+            "intent": "check",
+            "params": {"code": code_match.group(1) if code_match else None},
+            "reply": "Let me analyze that for you.",
+        }
+
+    if any(kw in msg for kw in ("form", "stats", "how is", "how are", "results for")):
+        for kw in ("form of", "stats for", "how is", "how are", "results for", "form"):
+            if kw in msg:
+                team = msg.split(kw, 1)[1].strip().rstrip("?. ")
+                if team:
+                    return {
+                        "intent": "stats",
+                        "params": {"team": team.title()},
+                        "reply": f"Checking {team.title()} form...",
+                    }
+        return {
+            "intent": "chat",
+            "params": {},
+            "reply": "Which team do you want to check? e.g. 'Arsenal form'",
+        }
+
+    if "league" in msg:
+        return {"intent": "leagues", "params": {}, "reply": "Here are the available leagues."}
+    if any(kw in msg for kw in ("timeframe", "window", "today", "weekend", "time")):
+        return {"intent": "timeframe", "params": {}, "reply": "Let's set your time window."}
+
+    return {
+        "intent": "chat",
+        "params": {},
+        "reply": "I'm SportyBot — your football betting assistant. Try asking for picks (e.g. '10 odds') or type /help to see commands.",
+    }

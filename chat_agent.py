@@ -45,11 +45,9 @@ from web_analyzer import get_team_results, _summarize_form
 
 logger = logging.getLogger(__name__)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.0-flash:generateContent"
-)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 
 MAX_HISTORY = 20
 HISTORY_TTL = 30 * 60  # 30 minutes
@@ -210,40 +208,131 @@ def _append(user_data: dict, role: str, parts: list[dict]) -> None:
         hist["messages"].pop(0)
 
 
-# ── Gemini API call ──────────────────────────────────────────────────────────
+# ── OpenRouter API call ──────────────────────────────────────────────────────
 
-def _call_gemini(history: list[dict]) -> dict | None:
-    """Call Gemini with function calling. Returns the response dict or None."""
-    if not GEMINI_API_KEY:
+def _history_to_openai(history: list[dict]) -> list[dict]:
+    """Convert Gemini-style history to OpenAI-style messages for OpenRouter."""
+    messages = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
+    for entry in history:
+        role = entry.get("role", "user")
+        parts = entry.get("parts", [])
+
+        # Map Gemini roles to OpenAI roles
+        oai_role = "assistant" if role == "model" else "user"
+
+        # Check for function calls (model → assistant with tool_calls)
+        fn_calls = [p for p in parts if "functionCall" in p]
+        if fn_calls:
+            tool_calls = []
+            for i, fc in enumerate(fn_calls):
+                tool_calls.append({
+                    "id": f"call_{i}",
+                    "type": "function",
+                    "function": {
+                        "name": fc["functionCall"]["name"],
+                        "arguments": json.dumps(fc["functionCall"].get("args", {})),
+                    },
+                })
+            messages.append({"role": "assistant", "tool_calls": tool_calls})
+            continue
+
+        # Check for function responses (user → tool messages)
+        fn_responses = [p for p in parts if "functionResponse" in p]
+        if fn_responses:
+            for i, fr in enumerate(fn_responses):
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": f"call_{i}",
+                    "content": json.dumps(fr["functionResponse"]["response"], default=str),
+                })
+            continue
+
+        # Regular text
+        text = "".join(p.get("text", "") for p in parts if "text" in p)
+        if text:
+            messages.append({"role": oai_role, "content": text})
+
+    return messages
+
+
+def _tool_declarations_to_openai() -> list[dict]:
+    """Convert Gemini-style tool declarations to OpenAI-style tools."""
+    tools = []
+    for decl in TOOL_DECLARATIONS:
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": decl["name"],
+                "description": decl["description"],
+                "parameters": decl.get("parameters", {"type": "object", "properties": {}}),
+            },
+        })
+    return tools
+
+
+def _call_llm(history: list[dict]) -> dict | None:
+    """Call OpenRouter with function calling. Returns Gemini-style content dict or None."""
+    if not OPENROUTER_API_KEY:
         return None
+
+    messages = _history_to_openai(history)
+    tools = _tool_declarations_to_openai()
+
     body = {
-        "contents": history,
-        "tools": [{"function_declarations": TOOL_DECLARATIONS}],
-        "systemInstruction": {"parts": [{"text": AGENT_SYSTEM_PROMPT}]},
-        "generationConfig": {
-            "temperature": 0.4,
-            "maxOutputTokens": 1024,
-        },
+        "model": OPENROUTER_MODEL,
+        "messages": messages,
+        "tools": tools,
+        "temperature": 0.4,
+        "max_tokens": 1024,
     }
+
     for attempt in range(2):
         try:
             resp = requests.post(
-                GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=20,
+                OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=30,
             )
             if resp.status_code == 429:
-                logger.warning("Gemini rate limited")
+                logger.warning("OpenRouter rate limited (429)")
+                return {"_error": "rate_limited"}
+            if resp.status_code != 200:
+                logger.warning(f"OpenRouter error {resp.status_code}: {resp.text[:200]}")
                 return None
+
             data = resp.json()
-            if "candidates" in data and data["candidates"]:
-                return data["candidates"][0]["content"]
-            logger.warning(f"Gemini no candidates: {data.get('error', data)}")
-            return None
+            choice = data.get("choices", [{}])[0]
+            msg = choice.get("message", {})
+
+            # Convert OpenAI response back to Gemini-style content dict
+            parts = []
+            if msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    try:
+                        args = json.loads(fn.get("arguments", "{}"))
+                    except json.JSONDecodeError:
+                        args = {}
+                    parts.append({
+                        "functionCall": {"name": fn["name"], "args": args}
+                    })
+            if msg.get("content"):
+                parts.append({"text": msg["content"]})
+
+            if not parts:
+                return None
+            return {"parts": parts}
+
         except requests.Timeout:
             if attempt == 0:
                 continue
             return None
         except Exception as e:
-            logger.warning(f"Gemini call failed: {e}")
+            logger.warning(f"OpenRouter call failed: {e}")
             return None
     return None
 
@@ -613,16 +702,18 @@ async def agent_respond(user_message: str, user_data: dict, chat_id: int) -> str
 
     Returns the final text response to send to the user.
     """
-    if not GEMINI_API_KEY:
-        return "Chat agent not available — GEMINI_API_KEY not configured."
+    if not OPENROUTER_API_KEY:
+        return "Chat agent not available — OPENROUTER_API_KEY not set in environment."
 
     history = _get_history(user_data)
     _append(user_data, "user", [{"text": user_message}])
 
     for _round in range(MAX_TOOL_ROUNDS):
-        content = await asyncio.to_thread(_call_gemini, history)
+        content = await asyncio.to_thread(_call_llm, history)
         if not content:
-            return "I'm having trouble thinking right now. Try again in a moment."
+            return "LLM API is down or returned an error. Use /pick or /check instead."
+        if isinstance(content, dict) and content.get("_error") == "rate_limited":
+            return "API rate limited. Try again in a minute."
 
         parts = content.get("parts", [])
 
