@@ -3286,18 +3286,10 @@ async def split_receive_targets(update: Update, context: ContextTypes.DEFAULT_TY
     for i, t in enumerate(result["tickets"]):
         buttons.append([
             InlineKeyboardButton(
-                f"📋 Book Ticket {t['ticket_num']} ({t['total_odds']:.2f} odds)",
+                f"📋 Book Ticket {t['ticket_num']} ({t['actual_odds']:.2f} odds)",
                 callback_data=f"split_book_{i}",
             )
         ])
-        # Add remove-insurance button if ticket has insurance picks
-        if t["insurance_picks"]:
-            buttons.append([
-                InlineKeyboardButton(
-                    f"🗑 Remove insurance from Ticket {t['ticket_num']}",
-                    callback_data=f"split_rmins_{i}",
-                )
-            ])
 
     buttons.append([InlineKeyboardButton("📋 Book All Tickets", callback_data="split_book_all")])
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="split_cancel")])
@@ -3310,7 +3302,7 @@ async def split_receive_targets(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def split_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle split confirmation buttons: book individual, book all, remove insurance, cancel."""
+    """Handle split confirmation buttons: book individual, book all, cancel."""
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -3327,62 +3319,11 @@ async def split_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("Split cancelled.")
         return ConversationHandler.END
 
-    # ── Remove insurance from a ticket ──
-    if data.startswith("split_rmins_"):
-        idx = int(data.split("_")[-1])
-        tickets = result["tickets"]
-        if 0 <= idx < len(tickets):
-            t = tickets[idx]
-            if t["insurance_picks"]:
-                removed = t["insurance_picks"]
-                t["insurance_picks"] = []
-                # Recalculate total odds without insurance
-                t["total_odds"] = t["actual_odds"]
-                t["pick_count"] = len(t["picks"])
-                context.user_data["split_result"] = result
-
-                names = ", ".join(
-                    f"{p['home']} vs {p['away']}" for p in removed
-                )
-                await query.edit_message_text(
-                    f"✅ Removed insurance from Ticket {idx + 1}.\n"
-                    f"Removed: {names}\n"
-                    f"New odds: *{t['total_odds']:.2f}* ({t['pick_count']} picks)",
-                    parse_mode="Markdown",
-                )
-
-                # Re-show buttons
-                buttons = []
-                for i, tk in enumerate(tickets):
-                    buttons.append([
-                        InlineKeyboardButton(
-                            f"📋 Book Ticket {tk['ticket_num']} ({tk['total_odds']:.2f} odds)",
-                            callback_data=f"split_book_{i}",
-                        )
-                    ])
-                    if tk["insurance_picks"]:
-                        buttons.append([
-                            InlineKeyboardButton(
-                                f"🗑 Remove insurance from Ticket {tk['ticket_num']}",
-                                callback_data=f"split_rmins_{i}",
-                            )
-                        ])
-                buttons.append([InlineKeyboardButton("📋 Book All Tickets", callback_data="split_book_all")])
-                buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="split_cancel")])
-
-                await query.message.reply_text(
-                    "Updated. What next?",
-                    reply_markup=InlineKeyboardMarkup(buttons),
-                )
-                return SPLIT_CONFIRM
-        return SPLIT_CONFIRM
-
     # ── Book a single ticket ──
     if data.startswith("split_book_"):
         idx_str = data.replace("split_book_", "")
 
         if idx_str == "all":
-            # Book all tickets
             await query.edit_message_text("📋 Booking all split tickets...")
             booked = []
             failed = []
@@ -3397,12 +3338,12 @@ async def split_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
             for i, t, code in booked:
                 lines.append(
                     f"✅ Ticket {t['ticket_num']}: `{code}` "
-                    f"({t['total_odds']:.2f} odds, {t['pick_count']} picks)"
+                    f"({t['actual_odds']:.2f} odds, {t['pick_count']} picks)"
                 )
             for i, t in failed:
                 lines.append(
                     f"❌ Ticket {t['ticket_num']}: booking failed "
-                    f"({t['total_odds']:.2f} odds, {t['pick_count']} picks)"
+                    f"({t['actual_odds']:.2f} odds, {t['pick_count']} picks)"
                 )
 
             await send_long_message(update.callback_query, "\n".join(lines))
@@ -3423,7 +3364,7 @@ async def split_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
                     await query.message.reply_text(
                         f"✅ *Ticket {t['ticket_num']}* booked!\n"
                         f"Code: `{code}`\n"
-                        f"Odds: {t['total_odds']:.2f} | Picks: {t['pick_count']}",
+                        f"Odds: {t['actual_odds']:.2f} | Picks: {t['pick_count']}",
                         parse_mode="Markdown",
                     )
                 else:
@@ -3432,7 +3373,7 @@ async def split_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
                         f"Some picks may have expired or the SportyBet API is down."
                     )
 
-                # Re-show remaining buttons (remove the booked one)
+                # Re-show remaining buttons
                 remaining = [
                     (i, tk) for i, tk in enumerate(tickets)
                     if i != idx
@@ -3442,7 +3383,7 @@ async def split_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
                     for i, tk in remaining:
                         buttons.append([
                             InlineKeyboardButton(
-                                f"📋 Book Ticket {tk['ticket_num']} ({tk['total_odds']:.2f} odds)",
+                                f"📋 Book Ticket {tk['ticket_num']} ({tk['actual_odds']:.2f} odds)",
                                 callback_data=f"split_book_{i}",
                             )
                         ])
@@ -3462,10 +3403,8 @@ async def split_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 async def _book_split_ticket(ticket: dict) -> str | None:
     """Book a single split ticket via SportyBet API. Returns booking code or None."""
-    all_picks = ticket["picks"] + ticket["insurance_picks"]
-
     selections = []
-    for pick in all_picks:
+    for pick in ticket["picks"]:
         sel = pick.get("selection", {})
         if not sel or not sel.get("eventId"):
             continue
@@ -4607,7 +4546,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, split_receive_targets),
             ],
             SPLIT_CONFIRM: [
-                CallbackQueryHandler(split_confirm_callback, pattern=r"^split_(book_\d+|book_all|rmins_\d+|cancel)$"),
+                CallbackQueryHandler(split_confirm_callback, pattern=r"^split_(book_\d+|book_all|cancel)$"),
             ],
         },
         fallbacks=[CommandHandler("cancel", split_cancel)],

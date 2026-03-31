@@ -189,10 +189,10 @@ TOOL_DECLARATIONS = [
         "name": "split_ticket",
         "description": (
             "Split a SportyBet booking code into multiple smaller tickets. "
-            "Fetches the code, partitions picks into N tickets targeting specified odds. "
-            "Safest picks fill the smallest target first, and safe 'insurance' picks are "
-            "duplicated into riskier tickets. Use when user says 'split this ticket', "
-            "'break it into X tickets', or similar."
+            "Fetches the code, selects subsets of picks to build N tickets at target odds. "
+            "Each ticket independently selects from the pool (picks can appear in multiple "
+            "tickets). Safety-first: safest picks are always selected first. "
+            "Use when user says 'split this ticket', 'break it into X tickets', or similar."
         ),
         "parameters": {
             "type": "object",
@@ -756,22 +756,12 @@ async def _tool_split_ticket(args: dict, user_data: dict) -> dict:
                 "market": p["market"], "pick": p["pick"],
                 "odds": round(float(p.get("odds", 1.0)), 2),
             })
-        insurance_out = []
-        for p in t["insurance_picks"]:
-            insurance_out.append({
-                "home": p["home"], "away": p["away"],
-                "market": p["market"], "pick": p["pick"],
-                "odds": round(float(p.get("odds", 1.0)), 2),
-                "insurance": True,
-            })
         tickets_out.append({
             "ticket_num": t["ticket_num"],
             "target_odds": t["target_odds"],
             "actual_odds": t["actual_odds"],
-            "total_odds": t["total_odds"],
             "pick_count": t["pick_count"],
             "picks": picks_out,
-            "insurance_picks": insurance_out,
         })
 
     ended_count = len(picks) - len(active_picks)
@@ -782,9 +772,9 @@ async def _tool_split_ticket(args: dict, user_data: dict) -> dict:
         "ended_excluded": ended_count,
         "tickets": tickets_out,
         "note": (
-            "Insurance picks (marked with insurance: true) are safe picks duplicated "
-            "from the safest pool into riskier tickets. The user can ask to remove them. "
-            "Present each ticket clearly and ask if they want to book any."
+            "Each ticket independently selects from the same pool, so some picks may "
+            "appear in multiple tickets (safest picks are reused). Present each ticket "
+            "clearly and ask if they want to book any."
         ),
     }
 
@@ -802,10 +792,9 @@ async def _tool_book_split_ticket(args: dict, user_data: dict) -> dict:
         return {"error": f"Invalid ticket number. Choose 1 to {len(tickets)}."}
 
     ticket = tickets[ticket_num - 1]
-    all_picks = ticket["picks"] + ticket["insurance_picks"]
 
     selections = []
-    for pick in all_picks:
+    for pick in ticket["picks"]:
         sel = pick.get("selection", {})
         if not sel or not sel.get("eventId"):
             continue
@@ -829,7 +818,7 @@ async def _tool_book_split_ticket(args: dict, user_data: dict) -> dict:
         return {
             "booking_code": code,
             "ticket_num": ticket_num,
-            "odds": ticket["total_odds"],
+            "odds": ticket["actual_odds"],
             "pick_count": ticket["pick_count"],
         }
     else:
