@@ -96,7 +96,7 @@ CHECK_CODES, CHECK_TARGET_ODDS, CHECK_EXCLUDE, CHECK_CONFIRM, CHECK_EXPAND, CHEC
 # Conversation states for /pick flow
 PICK_TYPE, PICK_COUNT, PICK_ODDS, PICK_MODE, PICK_REVIEW, GAME_DIALOGUE = range(10, 16)
 # Conversation states for /strategy custom flow
-STRAT_CUSTOM_CONFIDENCE, STRAT_CUSTOM_MARKETS, STRAT_CUSTOM_OVER, STRAT_CUSTOM_MIN_ODDS = range(20, 24)
+STRAT_CUSTOM_CONFIDENCE, STRAT_CUSTOM_MARKETS, STRAT_CUSTOM_OVER, STRAT_CUSTOM_MIN_ODDS, STRAT_LEAGUES, STRAT_TIMEFRAME = range(20, 26)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -595,7 +595,7 @@ def _get_strategy_label(user_config: dict) -> str:
     return _get_config_label(user_config)
 
 
-def _build_league_keyboard(active: set[int]) -> InlineKeyboardMarkup:
+def _build_league_keyboard(active: set[int], in_settings: bool = False) -> InlineKeyboardMarkup:
     """Build the league picker keyboard with category shortcuts."""
     buttons = []
 
@@ -661,10 +661,11 @@ def _build_league_keyboard(active: set[int]) -> InlineKeyboardMarkup:
     if row:
         buttons.append(row)
 
+    done_btn = InlineKeyboardButton("⬅️ Back", callback_data="league_done") if in_settings else InlineKeyboardButton("✅ Done", callback_data="league_done")
     buttons.append(
         [
             InlineKeyboardButton("🧹 Clear All", callback_data="league_clear_all"),
-            InlineKeyboardButton("✅ Done", callback_data="league_done"),
+            done_btn,
         ]
     )
     return InlineKeyboardMarkup(buttons)
@@ -2640,35 +2641,49 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
-async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show settings panel — confidence, markets, min odds."""
-    chat_id = update.effective_chat.id
-    context.user_data["chat_id"] = chat_id
-    config = load_user_config(chat_id=chat_id)
-
+def _settings_hub_content(config: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the settings hub text and keyboard. Reused from multiple places."""
     min_conf = config.get("min_confidence", 75)
     min_odds = config.get("min_odds", 1.05)
     enabled = config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
+    active_leagues = config.get("leagues", [])
+    league_names = [LEAGUE_NAMES.get(lid, str(lid)) for lid in active_leagues[:5]]
+    league_summary = ", ".join(league_names) or "None"
+    if len(active_leagues) > 5:
+        league_summary += f" +{len(active_leagues) - 5} more"
+    from config import TIMEFRAME_PRESETS
+    tf_key = config.get("timeframe", "7days")
+    tf_label = TIMEFRAME_PRESETS.get(tf_key, {}).get("label", tf_key)
 
-    lines = [
-        "⚙️ *Pick Settings*\n",
-        f"Confidence: ≥{min_conf}%",
-        f"Min Odds: ≥{min_odds}",
-        f"Markets: {', '.join(enabled)}",
-        "",
-        "Tap to adjust:",
-    ]
-
+    text = (
+        "⚙️ *Settings*\n\n"
+        f"📋 Leagues: {league_summary}\n"
+        f"⏰ Timeframe: {tf_label}\n"
+        f"🎯 Confidence: ≥{min_conf}%\n"
+        f"📊 Markets: {len(enabled)} enabled\n"
+        f"💰 Min Odds: ≥{min_odds}\n\n"
+        "Tap to adjust:"
+    )
     buttons = [
+        [
+            InlineKeyboardButton("📋 Leagues", callback_data="strat_leagues_menu"),
+            InlineKeyboardButton("⏰ Timeframe", callback_data="strat_timeframe_menu"),
+        ],
         [InlineKeyboardButton(f"🎯 Confidence ({min_conf}%)", callback_data="strat_conf_menu")],
         [InlineKeyboardButton(f"📊 Markets ({len(enabled)})", callback_data="strat_mkt_menu")],
         [InlineKeyboardButton(f"💰 Min Odds ({min_odds})", callback_data="strat_odds_menu")],
+        [InlineKeyboardButton("✅ Done", callback_data="strat_done")],
     ]
-    await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="Markdown",
-    )
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show unified settings panel — leagues, timeframe, confidence, markets, min odds."""
+    chat_id = update.effective_chat.id
+    context.user_data["chat_id"] = chat_id
+    config = load_user_config(chat_id=chat_id)
+    text, markup = _settings_hub_content(config)
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     return STRAT_CUSTOM_CONFIDENCE
 
 
@@ -2749,34 +2764,54 @@ async def callback_strategy_select(update: Update, context: ContextTypes.DEFAULT
         )
         return STRAT_CUSTOM_MIN_ODDS
 
-    elif data == "strat_back":
-        # Back to main settings
-        min_conf = config.get("min_confidence", 75)
-        min_odds = config.get("min_odds", 1.05)
-        enabled = config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
-        buttons = [
-            [InlineKeyboardButton(f"🎯 Confidence ({min_conf}%)", callback_data="strat_conf_menu")],
-            [InlineKeyboardButton(f"📊 Markets ({len(enabled)})", callback_data="strat_mkt_menu")],
-            [InlineKeyboardButton(f"💰 Min Odds ({min_odds})", callback_data="strat_odds_menu")],
-            [InlineKeyboardButton("✅ Done", callback_data="strat_done")],
-        ]
+    elif data == "strat_leagues_menu":
+        active = set(config.get("leagues", []))
         await query.edit_message_text(
-            f"⚙️ *Pick Settings*\n\n"
-            f"Confidence: ≥{min_conf}%\n"
-            f"Min Odds: ≥{min_odds}\n"
-            f"Markets: {', '.join(enabled)}\n\n"
-            "Tap to adjust:",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode="Markdown",
+            _format_league_selection_text(active),
+            reply_markup=_build_league_keyboard(active, in_settings=True),
         )
+        return STRAT_LEAGUES
+
+    elif data == "strat_timeframe_menu":
+        from config import TIMEFRAME_PRESETS
+        current = config.get("timeframe", "7days")
+        buttons = [
+            [
+                InlineKeyboardButton(f"{'✅ ' if current == 'today' else ''}Today", callback_data="strat_tf_today"),
+                InlineKeyboardButton(f"{'✅ ' if current == 'tomorrow' else ''}Tomorrow", callback_data="strat_tf_tomorrow"),
+                InlineKeyboardButton(f"{'✅ ' if current == 'weekend' else ''}Weekend", callback_data="strat_tf_weekend"),
+            ],
+            [
+                InlineKeyboardButton(f"{'✅ ' if current == '7days' else ''}Next 7 Days", callback_data="strat_tf_7days"),
+                InlineKeyboardButton(f"{'✅ ' if current == '14days' else ''}Next 14 Days", callback_data="strat_tf_14days"),
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data="strat_back")],
+        ]
+        current_label = TIMEFRAME_PRESETS.get(current, {}).get("label", current)
+        await query.edit_message_text(
+            f"⏰ Timeframe\nCurrent: {current_label}\n\nHow far ahead should /pick scan?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return STRAT_TIMEFRAME
+
+    elif data == "strat_back":
+        # Back to main settings hub
+        text, markup = _settings_hub_content(config)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
         return STRAT_CUSTOM_CONFIDENCE
 
     elif data == "strat_done":
         min_conf = config.get("min_confidence", 75)
         min_odds = config.get("min_odds", 1.05)
         enabled = config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
+        active_leagues = config.get("leagues", [])
+        league_names = [LEAGUE_NAMES.get(lid, str(lid)) for lid in active_leagues]
+        from config import TIMEFRAME_PRESETS
+        tf_label = TIMEFRAME_PRESETS.get(config.get("timeframe", "7days"), {}).get("label", "7 days")
         await query.edit_message_text(
             f"✅ Settings saved!\n\n"
+            f"Leagues: {', '.join(league_names) or 'None'}\n"
+            f"Timeframe: {tf_label}\n"
             f"Confidence: ≥{min_conf}%\n"
             f"Min Odds: ≥{min_odds}\n"
             f"Markets: {', '.join(enabled)}\n\n"
@@ -2819,22 +2854,11 @@ async def callback_strat_custom_confidence(update: Update, context: ContextTypes
     config["min_confidence"] = conf
     save_user_config(config, chat_id=chat_id)
 
-    # Show updated main menu
-    min_odds = config.get("min_odds", 1.05)
-    enabled = config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
-    buttons = [
-        [InlineKeyboardButton(f"🎯 Confidence ({conf}%)", callback_data="strat_conf_menu")],
-        [InlineKeyboardButton(f"📊 Markets ({len(enabled)})", callback_data="strat_mkt_menu")],
-        [InlineKeyboardButton(f"💰 Min Odds ({min_odds})", callback_data="strat_odds_menu")],
-        [InlineKeyboardButton("✅ Done", callback_data="strat_done")],
-    ]
+    # Show updated settings hub
+    text, markup = _settings_hub_content(config)
     await query.edit_message_text(
-        f"✅ Confidence set to {conf}%\n\n"
-        f"⚙️ *Pick Settings*\n"
-        f"Confidence: ≥{conf}%\n"
-        f"Min Odds: ≥{min_odds}\n"
-        f"Markets: {', '.join(enabled)}",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        f"✅ Confidence set to {conf}%\n\n" + text,
+        reply_markup=markup,
         parse_mode="Markdown",
     )
     return STRAT_CUSTOM_CONFIDENCE
@@ -2906,22 +2930,91 @@ async def callback_strat_custom_min_odds(update: Update, context: ContextTypes.D
     config["min_odds"] = min_odds
     save_user_config(config, chat_id=chat_id)
 
-    # Show updated main menu
-    min_conf = config.get("min_confidence", 75)
-    enabled = config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
-    buttons = [
-        [InlineKeyboardButton(f"🎯 Confidence ({min_conf}%)", callback_data="strat_conf_menu")],
-        [InlineKeyboardButton(f"📊 Markets ({len(enabled)})", callback_data="strat_mkt_menu")],
-        [InlineKeyboardButton(f"💰 Min Odds ({min_odds})", callback_data="strat_odds_menu")],
-        [InlineKeyboardButton("✅ Done", callback_data="strat_done")],
-    ]
+    # Show updated settings hub
+    text, markup = _settings_hub_content(config)
     await query.edit_message_text(
-        f"✅ Min Odds set to {min_odds}\n\n"
-        f"⚙️ *Pick Settings*\n"
-        f"Confidence: ≥{min_conf}%\n"
-        f"Min Odds: ≥{min_odds}\n"
-        f"Markets: {', '.join(enabled)}",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        f"✅ Min Odds set to {min_odds}\n\n" + text,
+        reply_markup=markup,
+        parse_mode="Markdown",
+    )
+    return STRAT_CUSTOM_CONFIDENCE
+
+
+async def callback_strat_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle league toggles within the settings ConversationHandler."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = update.effective_chat.id
+
+    if data == "league_done":
+        # Back to settings hub
+        config = load_user_config(chat_id=chat_id)
+        text, markup = _settings_hub_content(config)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+        return STRAT_CUSTOM_CONFIDENCE
+
+    # Reuse the existing toggle logic
+    config = load_user_config(chat_id=chat_id)
+    leagues = list(config.get("leagues", []))
+
+    if data == "league_clear_all":
+        leagues = []
+    elif data.startswith("league_cat_"):
+        category_key = data.replace("league_cat_", "")
+        category = LEAGUE_CATEGORIES.get(category_key)
+        if category:
+            category_ids = category["league_ids"]
+            if all(lid in leagues for lid in category_ids):
+                leagues = [lid for lid in leagues if lid not in category_ids]
+            else:
+                leagues = list(dict.fromkeys(leagues + category_ids))
+    elif data.startswith("league_toggle_"):
+        lid = int(data.replace("league_toggle_", ""))
+        if lid in leagues:
+            leagues.remove(lid)
+        else:
+            leagues.append(lid)
+
+    config["leagues"] = leagues
+    save_user_config(config, chat_id=chat_id)
+    active = set(leagues)
+    await query.edit_message_text(
+        _format_league_selection_text(active),
+        reply_markup=_build_league_keyboard(active, in_settings=True),
+    )
+    return STRAT_LEAGUES
+
+
+async def callback_strat_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle timeframe selection within settings ConversationHandler."""
+    from config import TIMEFRAME_PRESETS
+
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "strat_back":
+        config = load_user_config(chat_id=update.effective_chat.id)
+        text, markup = _settings_hub_content(config)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+        return STRAT_CUSTOM_CONFIDENCE
+
+    preset_key = data.replace("strat_tf_", "")
+    preset = TIMEFRAME_PRESETS.get(preset_key)
+    if not preset:
+        return STRAT_TIMEFRAME
+
+    chat_id = update.effective_chat.id
+    config = load_user_config(chat_id=chat_id)
+    config["timeframe"] = preset_key
+    save_user_config(config, chat_id=chat_id)
+
+    # Return to settings hub
+    text, markup = _settings_hub_content(config)
+    await query.edit_message_text(
+        f"✅ Timeframe set to {preset['label']}\n\n" + text,
+        reply_markup=markup,
         parse_mode="Markdown",
     )
     return STRAT_CUSTOM_CONFIDENCE
@@ -2934,33 +3027,65 @@ async def strategy_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def cmd_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Redirect to unified settings."""
+    return await cmd_strategy(update, context)
+
+
 async def cmd_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set the time window for /pick fixture scanning."""
-    from config import TIMEFRAME_PRESETS
+    """Redirect to unified settings."""
+    return await cmd_strategy(update, context)
 
-    config = load_user_config(chat_id=update.effective_chat.id)
-    current = config.get("timeframe", "7days")
-    current_label = TIMEFRAME_PRESETS.get(current, {}).get("label", current)
 
-    buttons = [
-        [
-            InlineKeyboardButton("Today", callback_data="tf_today"),
-            InlineKeyboardButton("Tomorrow", callback_data="tf_tomorrow"),
-            InlineKeyboardButton("Weekend", callback_data="tf_weekend"),
-        ],
-        [
-            InlineKeyboardButton("Next 7 Days", callback_data="tf_7days"),
-            InlineKeyboardButton("Next 14 Days", callback_data="tf_14days"),
-        ],
-    ]
-    await update.message.reply_text(
-        f"Select time window for /pick:\nCurrent: {current_label}",
-        reply_markup=InlineKeyboardMarkup(buttons),
+async def callback_league_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle league toggle from standalone /leagues (outside settings)."""
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = update.effective_chat.id
+    data = query.data
+    if data == "league_done":
+        config = load_user_config(chat_id=chat_id)
+        names = [LEAGUE_NAMES.get(lid, str(lid)) for lid in config["leagues"]]
+        await query.edit_message_text(
+            f"Leagues set: {', '.join(names) or 'None'}\n\n"
+            "Now run /pick to get selections.",
+        )
+        return
+
+    config = load_user_config(chat_id=chat_id)
+    leagues = list(config.get("leagues", []))
+
+    if data == "league_clear_all":
+        leagues = []
+    elif data.startswith("league_cat_"):
+        category_key = data.replace("league_cat_", "")
+        category = LEAGUE_CATEGORIES.get(category_key)
+        if category:
+            category_ids = category["league_ids"]
+            if all(lid in leagues for lid in category_ids):
+                leagues = [lid for lid in leagues if lid not in category_ids]
+            else:
+                leagues = list(dict.fromkeys(leagues + category_ids))
+    else:
+        lid = int(data.replace("league_toggle_", ""))
+        if lid in leagues:
+            leagues.remove(lid)
+        else:
+            leagues.append(lid)
+
+    config["leagues"] = leagues
+    save_user_config(config, chat_id=chat_id)
+
+    active = set(leagues)
+    await query.edit_message_text(
+        _format_league_selection_text(active),
+        reply_markup=_build_league_keyboard(active),
     )
 
 
 async def callback_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle timeframe button press."""
+    """Handle timeframe from standalone /timeframe (outside settings)."""
     from config import TIMEFRAME_PRESETS
 
     query = update.callback_query
@@ -2968,7 +3093,7 @@ async def callback_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE)
     preset_key = query.data.replace("tf_", "")
     preset = TIMEFRAME_PRESETS.get(preset_key)
     if not preset:
-        await query.edit_message_text("Unknown timeframe. Try /timeframe again.")
+        await query.edit_message_text("Unknown timeframe. Try /settings.")
         return
 
     chat_id = update.effective_chat.id
@@ -3813,17 +3938,13 @@ async def post_init(application: Application):
     """Set the bot commands menu after startup."""
     commands = [
         BotCommand("start", "Welcome & help"),
-        BotCommand("check", "Analyze SportyBet booking codes"),
         BotCommand("pick", "Get picks for target odds"),
-        BotCommand("leagues", "Select leagues to analyze"),
-        BotCommand("timeframe", "Set scan window (1-14 days)"),
-        BotCommand("refresh", "Fetch fresh fixture data"),
-        BotCommand("strategy", "Pick settings (confidence, markets, odds)"),
-        BotCommand("settings", "Pick settings (alias for /strategy)"),
+        BotCommand("check", "Analyze SportyBet booking codes"),
+        BotCommand("chat", "Chat with the AI analyst"),
+        BotCommand("settings", "Leagues, timeframe & pick settings"),
         BotCommand("budget", "Check API calls remaining"),
         BotCommand("status", "Current bot config"),
         BotCommand("health", "Runtime health & recent errors"),
-        BotCommand("chat", "Chat with the AI analyst"),
     ]
     await application.bot.set_my_commands(commands)
     logger.info("Bot command menu registered.")
@@ -4103,27 +4224,27 @@ def main():
     )
     app.add_handler(pick_conv)
 
-    # Other commands
+    # Other commands (leagues + timeframe are now entry points of strat_conv)
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("leagues", cmd_leagues))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("budget", cmd_budget))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("health", cmd_health))
-    app.add_handler(CommandHandler("timeframe", cmd_timeframe))
     app.add_handler(CommandHandler("chat", cmd_chat))
     app.add_error_handler(error_handler)
 
-    # Strategy/settings conversation handler
+    # Strategy/settings conversation handler (leagues + timeframe + strategy all in one)
     strat_conv = ConversationHandler(
         entry_points=[
             CommandHandler("strategy", cmd_strategy),
             CommandHandler("settings", cmd_strategy),
+            CommandHandler("leagues", cmd_leagues),
+            CommandHandler("timeframe", cmd_timeframe),
         ],
         states={
             STRAT_CUSTOM_CONFIDENCE: [
                 CallbackQueryHandler(callback_strat_custom_confidence, pattern=r"^strat_conf_"),
-                CallbackQueryHandler(callback_strategy_select, pattern=r"^strat_(conf_menu|mkt_menu|odds_menu|back|done|conservative|balanced|aggressive|overs_only|btts_mix|favourites)$"),
+                CallbackQueryHandler(callback_strategy_select, pattern=r"^strat_(conf_menu|mkt_menu|odds_menu|leagues_menu|timeframe_menu|back|done|conservative|balanced|aggressive|overs_only|btts_mix|favourites)$"),
             ],
             STRAT_CUSTOM_MARKETS: [
                 CallbackQueryHandler(callback_strat_custom_markets, pattern=r"^strat_mkt_"),
@@ -4135,6 +4256,12 @@ def main():
             STRAT_CUSTOM_MIN_ODDS: [
                 CallbackQueryHandler(callback_strat_custom_min_odds, pattern=r"^strat_minodds_"),
                 CallbackQueryHandler(callback_strategy_select, pattern=r"^strat_(back|done)$"),
+            ],
+            STRAT_LEAGUES: [
+                CallbackQueryHandler(callback_strat_leagues, pattern=r"^league_"),
+            ],
+            STRAT_TIMEFRAME: [
+                CallbackQueryHandler(callback_strat_timeframe, pattern=r"^strat_(tf_|back)"),
             ],
         },
         fallbacks=[CommandHandler("cancel", strategy_cancel)],
