@@ -8,7 +8,7 @@ Primary data source: football-data.org (free, 10 req/min, no daily cap)
 Fallback: thesportsdb.com (free, unlimited, but only ~1 recent result)
 Last resort: odds-based estimation (no external data needed)
 """
-from core.scorer import score_match
+
 from __future__ import annotations
 
 import hashlib
@@ -20,6 +20,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
+from core.scorer import score_match
 
 import requests
 from dotenv import load_dotenv
