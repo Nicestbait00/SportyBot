@@ -1,10 +1,16 @@
 """
 Ticket Splitter — select subsets from a pick pool to build smaller tickets.
 
-Each target ticket independently selects picks from the full pool.
-Picks CAN appear in multiple tickets — each ticket is a separate booking code.
-Safety-first: always starts with the safest picks and adds riskier ones only
-when needed to reach the target odds.
+Unique-first: each ticket gets its own picks to avoid correlated risk.
+If a shared "safe" pick upsets, all tickets sharing it lose together —
+so we only reuse picks when the remaining pool can't reach the target.
+
+Algorithm:
+  1. Sort picks safest→riskiest, targets smallest→largest
+  2. For each target: greedily select from REMAINING pool only
+  3. If remaining pool can't reach target: supplement with safest
+     already-used picks (marked shared=True)
+  4. Remove uniquely-selected picks from pool after each ticket
 
 No Telegram imports. Pure splitting logic.
 """
@@ -75,56 +81,43 @@ def _product_odds(picks: list[dict]) -> float:
 
 # ── Core: greedy subset selection ─────────────────────────────────────────────
 
-def _select_for_target(sorted_picks: list[dict], target: float) -> list[dict]:
-    """Select the safest subset of picks whose product ≈ target odds.
+def _select_from_pool(pool: list[dict], target: float) -> list[dict]:
+    """Greedy selection from pool (must be sorted safest-first).
 
-    sorted_picks must be pre-sorted ascending by odds (safest first).
-    Greedy: adds picks from safest until we hit/exceed the target,
-    then tries swapping the last pick for a tighter fit.
+    Adds picks until product >= target, then swap-tunes the last pick
+    for a tighter fit.
     """
-    if target <= 1.0:
+    if target <= 1.0 or not pool:
         return []
 
     log_target = math.log(target)
     selected = []
     running_log = 0.0
 
-    for pick in sorted_picks:
+    for pick in pool:
         if running_log >= log_target:
             break
         selected.append(pick)
         running_log += _pick_log_odds(pick)
 
     if not selected:
-        return [sorted_picks[0]] if sorted_picks else []
+        return [pool[0]] if pool else []
 
-    # ── Fine-tune: if we overshot, try swapping the last pick ──
-    # Check if removing the last pick and trying subsequent ones gets closer
+    # Swap-tune: if overshot, try replacing last pick with a closer fit
     if len(selected) >= 2 and running_log > log_target:
-        overshoot = running_log - log_target
         last = selected[-1]
         last_log = _pick_log_odds(last)
-        without_last = running_log - last_log
-
-        # How much do we still need without the last pick?
-        needed = log_target - without_last
+        needed = log_target - (running_log - last_log)
 
         if needed > 0:
-            # Find the pick in the pool closest to 'needed' log-odds
-            best_swap = last
-            best_diff = abs(last_log - needed)
-
-            for p in sorted_picks:
-                if p is last:
+            best_swap, best_diff = last, abs(last_log - needed)
+            sel_ids = {id(s) for s in selected[:-1]}
+            for p in pool:
+                if id(p) in sel_ids or p is last:
                     continue
-                if any(p.get("event_id") == s.get("event_id") for s in selected[:-1]):
-                    continue  # already in the selection
-                p_log = _pick_log_odds(p)
-                diff = abs(p_log - needed)
+                diff = abs(_pick_log_odds(p) - needed)
                 if diff < best_diff:
-                    best_swap = p
-                    best_diff = diff
-
+                    best_swap, best_diff = p, diff
             if best_swap is not last:
                 selected[-1] = best_swap
 
@@ -137,50 +130,86 @@ def split_ticket(
     picks: list[dict],
     targets: list[float],
 ) -> dict:
-    """Split picks into multiple tickets by selecting subsets for each target.
+    """Split picks into multiple tickets, unique-first.
 
-    Each ticket independently selects from the full pool (picks can repeat
-    across tickets). Safety-first: safest picks are selected first.
+    Each ticket draws from its own subset of the pool. Picks are only
+    reused across tickets when the remaining pool can't reach the target —
+    in that case, the safest already-used picks are borrowed and marked
+    shared=True so the user can see (and optionally remove) them.
 
-    Args:
-        picks: List of pick dicts, each must have an "odds" key.
-        targets: Target odds per ticket (e.g., [10.0, 50.0, 100.0]).
-
-    Returns:
-        {
-            "tickets": [{
-                "ticket_num": int,
-                "target_odds": float,
-                "actual_odds": float,
-                "picks": [pick_dict, ...],
-                "pick_count": int,
-            }],
-            "total_original_odds": float,
-        }
+    Targets are processed smallest-first so small tickets consume fewer
+    picks, leaving more for bigger targets.
     """
-    # Sort the full pool safest first
-    sorted_pool = sorted(picks, key=lambda p: _pick_odds(p))
-
     total_log = sum(_pick_log_odds(p) for p in picks)
+    total_odds = math.exp(total_log)
 
-    tickets = []
-    for i, target in enumerate(targets):
-        # Cap target at total odds — can't exceed the full ticket
-        capped = min(target, math.exp(total_log))
-        selected = _select_for_target(sorted_pool, capped)
+    # Sort targets ascending but remember original order for output
+    indexed_targets = sorted(enumerate(targets), key=lambda x: x[1])
+
+    # Available pool — picks not yet claimed by any ticket
+    remaining = sorted(picks, key=lambda p: _pick_odds(p))
+    used_picks: list[dict] = []  # picks already assigned (safest first)
+
+    results: list[dict] = [None] * len(targets)  # type: ignore
+
+    for orig_idx, target in indexed_targets:
+        capped = min(target, total_odds)
+        remaining_max = _product_odds(remaining)
+
+        if remaining_max >= capped * 0.90:
+            # ── Unique path: enough odds in remaining pool ──
+            selected = _select_from_pool(remaining, capped)
+            for p in selected:
+                p["shared"] = False
+            # Remove selected from remaining
+            sel_ids = {id(p) for p in selected}
+            remaining = [p for p in remaining if id(p) not in sel_ids]
+            used_picks.extend(sorted(selected, key=lambda p: _pick_odds(p)))
+        else:
+            # ── Fallback: supplement with safest already-used picks ──
+            combined = list(remaining)
+            # Add already-used picks (safest first) until we have enough
+            for up in used_picks:
+                if _product_odds(combined) >= capped:
+                    break
+                if not any(id(c) == id(up) for c in combined):
+                    shared_copy = dict(up)
+                    shared_copy["shared"] = True
+                    combined.append(shared_copy)
+            combined.sort(key=lambda p: _pick_odds(p))
+
+            selected = _select_from_pool(combined, capped)
+
+            # Mark which are shared vs unique
+            remaining_ids = {id(p) for p in remaining}
+            unique_in_sel = []
+            for p in selected:
+                if id(p) in remaining_ids:
+                    p["shared"] = False
+                    unique_in_sel.append(p)
+                # shared copies already have shared=True from above
+
+            # Remove only uniquely-claimed picks from remaining
+            unique_ids = {id(p) for p in unique_in_sel}
+            remaining = [p for p in remaining if id(p) not in unique_ids]
+            used_picks.extend(sorted(unique_in_sel, key=lambda p: _pick_odds(p)))
+
         actual = _product_odds(selected)
+        shared_count = sum(1 for p in selected if p.get("shared"))
 
-        tickets.append({
-            "ticket_num": i + 1,
+        results[orig_idx] = {
+            "ticket_num": orig_idx + 1,
             "target_odds": target,
             "actual_odds": round(actual, 2),
             "picks": selected,
             "pick_count": len(selected),
-        })
+            "shared_count": shared_count,
+            "unique": shared_count == 0,
+        }
 
     return {
-        "tickets": tickets,
-        "total_original_odds": round(math.exp(total_log), 2),
+        "tickets": results,
+        "total_original_odds": round(total_odds, 2),
     }
 
 
@@ -193,6 +222,7 @@ def format_split_summary(result: dict) -> str:
         f"Original ticket: *{result['total_original_odds']:.2f}* total odds\n"
     )
 
+    total_shared = 0
     for t in result["tickets"]:
         diff_pct = ((t["actual_odds"] - t["target_odds"]) / t["target_odds"]) * 100
         if abs(diff_pct) < 5:
@@ -202,7 +232,8 @@ def format_split_summary(result: dict) -> str:
         else:
             arrow = "🔻"
 
-        lines.append(f"━━━ *Ticket {t['ticket_num']}* ━━━")
+        unique_tag = "  🟢 All unique" if t.get("unique") else ""
+        lines.append(f"━━━ *Ticket {t['ticket_num']}* ━━━{unique_tag}")
         lines.append(
             f"🎯 Target: {t['target_odds']:.2f}  →  "
             f"Actual: *{t['actual_odds']:.2f}* odds  {arrow}"
@@ -215,25 +246,27 @@ def format_split_summary(result: dict) -> str:
             away = pick.get("away", "?")
             market = pick.get("market", "?")
             pick_label = pick.get("pick", "?")
-            lines.append(f"  {j}. {home} vs {away}")
+            shared_tag = " 🔁" if pick.get("shared") else ""
+            lines.append(f"  {j}. {home} vs {away}{shared_tag}")
             lines.append(f"     {market}: {pick_label} @ {odds:.2f}")
+
+        shared_count = t.get("shared_count", 0)
+        total_shared += shared_count
+        if shared_count:
+            lines.append(
+                f"\n  ⚠️ {shared_count} shared pick(s) — "
+                f"also in other ticket(s). Remove if you prefer independence."
+            )
 
         lines.append("")
 
-    # Show overlap info
-    all_event_ids = []
-    for t in result["tickets"]:
-        all_event_ids.append({p.get("event_id") for p in t["picks"]})
-
-    if len(all_event_ids) >= 2:
-        shared = all_event_ids[0]
-        for s in all_event_ids[1:]:
-            shared = shared & s
-        if shared:
-            lines.append(
-                f"ℹ️ {len(shared)} pick(s) appear in multiple tickets "
-                f"(safest picks selected across tickets)"
-            )
+    if total_shared == 0:
+        lines.append("✅ All tickets are fully independent — no shared picks.")
+    else:
+        lines.append(
+            f"ℹ️ {total_shared} pick(s) shared across tickets (marked 🔁). "
+            f"These were needed to reach the target odds."
+        )
 
     return "\n".join(lines)
 
