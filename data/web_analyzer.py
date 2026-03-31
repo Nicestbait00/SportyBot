@@ -529,7 +529,7 @@ def analyze_pick(pick: dict) -> dict:
         reasons.insert(0, f"📊 Good data — {total_results} recent matches analyzed")
 
     # Score the pick — use score_match() (same scorer as /pick)
-if home_form or away_form:
+if home_form or away_form:    
     scored = score_match(
         home_form or {},
         away_form or {},
@@ -579,8 +579,8 @@ if home_form or away_form:
         # market wasn't mapped — safe fallback
         confidence = _score_pick(market, pick_desc, odds, home_name, away_name,
                                  home_form, away_form, reasons)
-else:
-    confidence = _odds_to_confidence(odds)
+else:    
+    confidence = _odds_to_confidence(odds)        
 
     # When data is poor, DO NOT silently fall back to odds-based estimates.
     # Instead, mark clearly so the user can decide.
