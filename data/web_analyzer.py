@@ -527,13 +527,59 @@ def analyze_pick(pick: dict) -> dict:
         data_quality = "good"
         reasons.insert(0, f"📊 Good data — {total_results} recent matches analyzed")
 
-    # Score the pick
-    confidence = _score_pick(
-        market, pick_desc, odds,
-        home_name, away_name,
-        home_form, away_form,
-        reasons,
+    # Score the pick — use score_match() (same scorer as /pick)
+if home_form or away_form:
+    scored = score_match(
+        home_form or {},
+        away_form or {},
+        home_results,    # already fetched above
+        away_results,    # already fetched above
     )
+    mk = market.lower()
+    pk = pick_desc.lower()
+    scored_key = None
+
+    if "1x2" in mk or "match result" in mk or "winner" in mk:
+        if "home" in pk or pk.strip() == "1":
+            scored_key = "home_win"
+        elif "away" in pk or pk.strip() == "2":
+            scored_key = "away_win"
+        elif "draw" in pk or pk.strip() == "x":
+            scored_key = "draw"
+
+    elif "over" in pk or "under" in pk:
+        for line in ["0.5", "1.5", "2.5", "3.5"]:
+            if line in pk:
+                if "under" in pk:
+                    r = scored.get(f"over_{line}", {})
+                    confidence = 100 - r.get("confidence", 50)
+                    reasons.extend(r.get("reasons", [])[:3])
+                else:
+                    scored_key = f"over_{line}"
+                break
+
+    elif "gg" in mk or "btts" in mk or "both" in mk:
+        if "yes" in pk or "gg" in pk:
+            scored_key = "btts"
+        else:
+            r = scored.get("btts", {})
+            confidence = 100 - r.get("confidence", 50)
+            reasons.extend(r.get("reasons", [])[:3])
+
+    elif "double chance" in mk:
+        if "1x" in pk:   scored_key = "double_chance_1x"
+        elif "x2" in pk: scored_key = "double_chance_x2"
+        elif "12" in pk:  scored_key = "double_chance_12"
+
+    if scored_key and scored_key in scored:
+        confidence = scored[scored_key]["confidence"]
+        reasons.extend(scored[scored_key]["reasons"][:3])
+    elif scored_key is not None:
+        # market wasn't mapped — safe fallback
+        confidence = _score_pick(market, pick_desc, odds, home_name, away_name,
+                                 home_form, away_form, reasons)
+else:
+    confidence = _odds_to_confidence(odds)
 
     # When data is poor, DO NOT silently fall back to odds-based estimates.
     # Instead, mark clearly so the user can decide.
