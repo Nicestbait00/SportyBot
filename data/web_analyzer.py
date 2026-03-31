@@ -542,7 +542,7 @@ def analyze_pick(pick: dict) -> dict:
         reasons.append("❌ Cannot analyze — no historical data found for these teams. You decide on this one.")
     elif data_quality == "limited":
         # Slight penalty, but keep data-driven score
-        confidence = int(confidence * 0.8)
+        confidence = int(confidence * 0.9)
 
     # Determine verdict
     if data_quality == "none":
