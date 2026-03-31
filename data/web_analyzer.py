@@ -8,7 +8,7 @@ Primary data source: football-data.org (free, 10 req/min, no daily cap)
 Fallback: thesportsdb.com (free, unlimited, but only ~1 recent result)
 Last resort: odds-based estimation (no external data needed)
 """
-
+from core.scorer import score_match
 from __future__ import annotations
 
 import hashlib
@@ -33,7 +33,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 FOOTBALL_DATA_KEY = os.getenv("FOOTBALL_DATA_KEY", "")
 FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
-SPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/3"
+SPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/60130162"
 
 # football-data.org team name mapping (built on first use, cached to disk)
 _FD_TEAM_MAP_FILE = CACHE_DIR / "fd_team_map.json"
@@ -319,7 +319,7 @@ def sportsdb_get_last_results(team_id: str) -> list[dict]:
         events = resp.json().get("results") or []
 
         results = []
-        for e in events[:5]:
+        for e in events[:10]:
             hs = _safe_int(e.get("intHomeScore"))
             as_ = _safe_int(e.get("intAwayScore"))
             is_home = str(e.get("idHomeTeam")) == str(team_id)
