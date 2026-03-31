@@ -810,8 +810,12 @@ async def _prompt_pick_ticket_count(message, edit: bool = False):
     return PICK_COUNT
 
 
-async def _prompt_pick_target_odds(message, edit: bool = False):
+async def _prompt_pick_target_odds(message, context=None, edit: bool = False):
     """Ask for target odds per ticket."""
+    req = _ensure_pick_request(context) if context else {}
+    is_multi = req.get("ticket_type") == "multiple"
+    count = int(req.get("ticket_count", 2)) if is_multi else 0
+
     buttons = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("3 odds", callback_data="pick_target_3"),
@@ -824,12 +828,18 @@ async def _prompt_pick_target_odds(message, edit: bool = False):
             InlineKeyboardButton("50 odds", callback_data="pick_target_50"),
         ],
     ])
-    await _send_or_edit(
-        message,
-        "🎯 What odds are you targeting per ticket?\nPick below or type a custom number.",
-        reply_markup=buttons,
-        edit=edit,
-    )
+
+    if is_multi and count >= 2:
+        text = (
+            f"🎯 What odds are you targeting for your {count} tickets?\n\n"
+            f"• Tap a button for the *same* odds on all tickets\n"
+            f"• Or type individual odds separated by commas\n"
+            f"  e.g. `5,10,25` for 3 different targets"
+        )
+    else:
+        text = "🎯 What odds are you targeting per ticket?\nPick below or type a custom number."
+
+    await _send_or_edit(message, text, reply_markup=buttons, edit=edit, parse_mode="Markdown" if is_multi else None)
     return PICK_ODDS
 
 
@@ -860,7 +870,7 @@ async def _continue_pick_request_flow(message, context, edit: bool = False):
     if req["ticket_type"] == "multiple" and (ticket_count is None or ticket_count < 2):
         return await _prompt_pick_ticket_count(message, edit=edit)
     if not req.get("target_odds"):
-        return await _prompt_pick_target_odds(message, edit=edit)
+        return await _prompt_pick_target_odds(message, context=context, edit=edit)
     if req["ticket_type"] == "multiple" and req.get("ticket_mode") not in ("unique", "dynamic"):
         return await _prompt_pick_ticket_mode(message, edit=edit)
 
@@ -1065,17 +1075,52 @@ async def pick_receive_count_button(update: Update, context: ContextTypes.DEFAUL
 
 
 async def pick_receive_odds_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive target odds as text."""
+    """Receive target odds as text. Supports comma-separated for multi-ticket."""
+    raw = update.message.text.strip()
+    req = _ensure_pick_request(context)
+    is_multi = req.get("ticket_type") == "multiple"
+    count = int(req.get("ticket_count", 2)) if is_multi else 0
+
+    # Try parsing as comma-separated list first (e.g. "5,10,25")
+    if "," in raw and is_multi:
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        targets = []
+        for p in parts:
+            try:
+                t = float(p)
+                if t < 1.5 or t > 500:
+                    await update.message.reply_text(f"Each target must be between 1.5 and 500. `{p}` is out of range.", parse_mode="Markdown")
+                    return PICK_ODDS
+                targets.append(t)
+            except ValueError:
+                await update.message.reply_text(f"Couldn't parse `{p}` as a number. Try again.", parse_mode="Markdown")
+                return PICK_ODDS
+
+        if len(targets) != count:
+            await update.message.reply_text(
+                f"You have {count} tickets but gave {len(targets)} target(s). "
+                f"Send exactly {count} values (e.g. `5,10,25`).",
+                parse_mode="Markdown",
+            )
+            return PICK_ODDS
+
+        req["target_odds"] = targets[0]  # for display/compat
+        req["target_odds_list"] = targets
+        context.user_data["pick_request"] = req
+        context.user_data["pick_target"] = targets[0]
+        return await _continue_pick_request_flow(update.message, context)
+
+    # Single number
     try:
-        target = float(update.message.text.strip())
+        target = float(raw)
     except ValueError:
-        await update.message.reply_text("Send a number (e.g. 10) or /cancel.")
+        await update.message.reply_text("Send a number (e.g. 10) or comma-separated (e.g. 5,10,25). /cancel to exit.")
         return PICK_ODDS
     if target < 1.5 or target > 500:
         await update.message.reply_text("Target odds must be between 1.5 and 500. Try again or /cancel.")
         return PICK_ODDS
-    req = _ensure_pick_request(context)
     req["target_odds"] = target
+    req.pop("target_odds_list", None)
     context.user_data["pick_request"] = req
     context.user_data["pick_target"] = target
     return await _continue_pick_request_flow(update.message, context)
@@ -1143,7 +1188,7 @@ async def _pick_analyze_from_message(message, context, target: float):
         # Check analysis cache first (valid for 3 hours)
         cache_key_raw = f"pick_sportybet|{date_str}|{sorted(leagues)}|{timeframe}"
         cache_key = hashlib.sha256(cache_key_raw.encode()).hexdigest()[:16]
-        cache_dir = Path(__file__).resolve().parent / ".cache" / "analysis"
+        cache_dir = Path(__file__).resolve().parent.parent / ".cache" / "analysis"
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_path = cache_dir / f"{cache_key}.json"
 
@@ -1369,11 +1414,15 @@ def _generate_pick_bundle(context) -> tuple[list[dict], dict | None, bool]:
 
     ticket_count = int(req.get("ticket_count", 2))
     ticket_mode = req.get("ticket_mode", "dynamic")
+    targets = req.get("target_odds_list") or target
+
     if ticket_mode == "unique":
-        bundle, profile = _generate_unique_bundle(all_scored, ticket_count, target, pick_cfg, excluded, shuffle_seed)
+        # Unique mode uses a single target (same fixtures, different markets)
+        single_target = targets[0] if isinstance(targets, list) else targets
+        bundle, profile = _generate_unique_bundle(all_scored, ticket_count, single_target, pick_cfg, excluded, shuffle_seed)
         return bundle, profile, False
 
-    bundle, profile, reused = _generate_dynamic_bundle(all_scored, ticket_count, target, pick_cfg, excluded, None, shuffle_seed)
+    bundle, profile, reused = _generate_dynamic_bundle(all_scored, ticket_count, targets, pick_cfg, excluded, None, shuffle_seed)
     return bundle, profile, reused
 
 
@@ -1424,10 +1473,17 @@ async def _show_pick_bundle_summary(message, context, edit: bool = False):
         await _send_or_edit(message, "No tickets available right now.", edit=edit)
         return ConversationHandler.END
 
+    targets_list = req.get("target_odds_list")
+    if targets_list and len(set(targets_list)) > 1:
+        targets_str = ", ".join(f"{t:.0f}" for t in targets_list)
+        target_line = f"Targets: {targets_str} odds"
+    else:
+        target_line = f"Target per ticket: ~{float(req.get('target_odds') or 0):.0f} odds"
+
     lines = [
         f"🎫 Bundle ready: {len(bundle)} ticket(s)",
         f"Mode: {req.get('ticket_mode', 'dynamic').title()}",
-        f"Target per ticket: ~{float(req.get('target_odds') or 0):.0f} odds",
+        target_line,
         "",
     ]
 
@@ -2560,7 +2616,7 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2. Clear analysis cache
     from pathlib import Path
-    cache_dir = Path(__file__).resolve().parent / ".cache" / "analysis"
+    cache_dir = Path(__file__).resolve().parent.parent / ".cache" / "analysis"
     cleared = 0
     if cache_dir.exists():
         for f in cache_dir.glob("*.json"):

@@ -25,11 +25,11 @@ from core.scorer import score_match
 import requests
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "web"
+CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache" / "web"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 FOOTBALL_DATA_KEY = os.getenv("FOOTBALL_DATA_KEY", "")

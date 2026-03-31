@@ -525,13 +525,17 @@ def select_unique_ticket_from_pool(
 def generate_dynamic_bundle(
     all_scored: list[dict],
     ticket_count: int,
-    target: float,
+    target: float | list[float],
     pick_cfg: dict,
     excluded: set[str],
     market_slots: list[dict] | None = None,
     shuffle_seed: int = 0,
 ) -> tuple[list[dict], dict | None, bool]:
-    """Build a dynamic multi-ticket bundle with soft fallback."""
+    """Build a dynamic multi-ticket bundle with soft fallback.
+
+    target can be a single float (same for all) or a list of per-ticket targets.
+    """
+    targets = target if isinstance(target, list) else [target] * ticket_count
     best_bundle: list[dict] = []
     best_profile = None
     profiles = build_fallback_profiles(pick_cfg)
@@ -541,12 +545,13 @@ def generate_dynamic_bundle(
         used_match_keys: set[str] = set()
         qualified = build_qualified_pool(all_scored, excluded, profile, market_slots, shuffle_seed)
         for ticket_id in range(1, ticket_count + 1):
+            t = targets[ticket_id - 1] if ticket_id - 1 < len(targets) else targets[-1]
             picks = select_ticket_from_pool(
-                qualified, target, market_slots, used_match_keys,
+                qualified, t, market_slots, used_match_keys,
             )
             if not picks:
                 break
-            bundle.append(make_ticket_entry(ticket_id, "dynamic", target, picks, profile.get("notes", [])))
+            bundle.append(make_ticket_entry(ticket_id, "dynamic", t, picks, profile.get("notes", [])))
             used_match_keys.update({match_key(p) for p in picks})
         if len(bundle) > len(best_bundle):
             best_bundle = bundle
@@ -575,17 +580,18 @@ def generate_dynamic_bundle(
         used_pick_keys.update({pick_key(p) for p in ticket["picks"]})
     qualified = build_qualified_pool(all_scored, excluded, best_profile, market_slots, shuffle_seed)
     for ticket_id in range(len(reuse_bundle) + 1, ticket_count + 1):
+        t = targets[ticket_id - 1] if ticket_id - 1 < len(targets) else targets[-1]
         picks = select_ticket_from_pool(
-            qualified, target, market_slots,
+            qualified, t, market_slots,
             disallowed_match_keys=set(),
             disallowed_pick_keys=used_pick_keys,
         )
         if not picks:
-            picks = select_ticket_from_pool(qualified, target, market_slots, set())
+            picks = select_ticket_from_pool(qualified, t, market_slots, set())
         if not picks:
             break
         notes = list(best_profile.get("notes", [])) + ["Reused fixtures after pool exhaustion"]
-        reuse_bundle.append(make_ticket_entry(ticket_id, "dynamic", target, picks, notes, reused_fixtures=True))
+        reuse_bundle.append(make_ticket_entry(ticket_id, "dynamic", t, picks, notes, reused_fixtures=True))
         used_pick_keys.update({pick_key(p) for p in picks})
 
     if len(reuse_bundle) > len(best_bundle):

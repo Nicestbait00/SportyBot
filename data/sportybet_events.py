@@ -21,7 +21,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "sportybet"
+CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache" / "sportybet"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 SPORTYBET_API = "https://www.sportybet.com/api/ng/factsCenter/pcUpcomingEvents"

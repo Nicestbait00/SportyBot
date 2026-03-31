@@ -12,7 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Load .env from project root
-_env_path = Path(__file__).resolve().parent / ".env"
+_env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_env_path)
 
 # ── API-Football (v3) ────────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ SPORTYBET_BASE_URL: str = os.getenv(
 )
 
 # ── Cache settings ───────────────────────────────────────────────────────────
-CACHE_DIR: Path = Path(__file__).resolve().parent / ".cache"
+CACHE_DIR: Path = Path(__file__).resolve().parent.parent / ".cache"
 CACHE_TTL_SECONDS: int = 6 * 60 * 60  # 6 hours
 
 # ── Common league IDs (API-Football v3) ──────────────────────────────────────
@@ -431,8 +431,8 @@ TIMEFRAME_PRESETS = {
 
 
 # ── User config (persisted preferences) ────────────────────────────────────
-USER_CONFIG_PATH: Path = Path(__file__).resolve().parent / "user_config.json"
-USER_CONFIG_DIR: Path = Path(__file__).resolve().parent / ".config"
+USER_CONFIG_PATH: Path = Path(__file__).resolve().parent.parent / "user_config.json"
+USER_CONFIG_DIR: Path = Path(__file__).resolve().parent.parent / ".config"
 
 # Friendly league names for Telegram display
 LEAGUE_NAMES: dict[int, str] = dict(LEAGUE_DISPLAY_NAMES)
