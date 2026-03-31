@@ -368,7 +368,7 @@ def _normalise(n: str) -> str:
     return _strip_suffix(n).lower().strip()
 
     # Top-level cache: avoid re-running source lookups for the same team (12h TTL)
-    top_key = _cache_key("team_results", f"{team_name.lower()}_{count}")
+    top_key = _cache_key("team_results", f"{_normalise(team_name)}_{count}")
     cached = _cache_get(top_key, ttl=43200)
     if cached is not None:
         return cached
