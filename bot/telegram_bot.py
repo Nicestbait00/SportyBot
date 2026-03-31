@@ -873,7 +873,7 @@ async def _continue_pick_request_flow(message, context, edit: bool = False):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Welcome message and quick setup."""
-    from config import TIMEFRAME_PRESETS
+    from core.config import TIMEFRAME_PRESETS
     chat_id = update.effective_chat.id
     config = load_user_config(chat_id=chat_id)
     league_names = [LEAGUE_NAMES.get(lid, str(lid)) for lid in config["leagues"]]
@@ -2618,7 +2618,7 @@ async def cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current configuration and data freshness."""
-    from config import TIMEFRAME_PRESETS
+    from core.config import TIMEFRAME_PRESETS
 
     config = load_user_config(chat_id=update.effective_chat.id)
     budget = await asyncio.to_thread(get_api_budget)
@@ -2654,7 +2654,7 @@ def _settings_hub_content(config: dict) -> tuple[str, InlineKeyboardMarkup]:
     league_summary = ", ".join(league_names) or "None"
     if len(active_leagues) > 5:
         league_summary += f" +{len(active_leagues) - 5} more"
-    from config import TIMEFRAME_PRESETS
+    from core.config import TIMEFRAME_PRESETS
     tf_key = config.get("timeframe", "7days")
     tf_label = TIMEFRAME_PRESETS.get(tf_key, {}).get("label", tf_key)
 
@@ -2776,7 +2776,7 @@ async def callback_strategy_select(update: Update, context: ContextTypes.DEFAULT
         return STRAT_LEAGUES
 
     elif data == "strat_timeframe_menu":
-        from config import TIMEFRAME_PRESETS
+        from core.config import TIMEFRAME_PRESETS
         current = config.get("timeframe", "7days")
         buttons = [
             [
@@ -2809,7 +2809,7 @@ async def callback_strategy_select(update: Update, context: ContextTypes.DEFAULT
         enabled = config.get("enabled_markets", DEFAULT_ENABLED_MARKETS)
         active_leagues = config.get("leagues", [])
         league_names = [LEAGUE_NAMES.get(lid, str(lid)) for lid in active_leagues]
-        from config import TIMEFRAME_PRESETS
+        from core.config import TIMEFRAME_PRESETS
         tf_label = TIMEFRAME_PRESETS.get(config.get("timeframe", "7days"), {}).get("label", "7 days")
         await query.edit_message_text(
             f"✅ Settings saved!\n\n"
@@ -2991,7 +2991,7 @@ async def callback_strat_leagues(update: Update, context: ContextTypes.DEFAULT_T
 
 async def callback_strat_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle timeframe selection within settings ConversationHandler."""
-    from config import TIMEFRAME_PRESETS
+    from core.config import TIMEFRAME_PRESETS
 
     query = update.callback_query
     await query.answer()
@@ -3089,7 +3089,7 @@ async def callback_league_toggle(update: Update, context: ContextTypes.DEFAULT_T
 
 async def callback_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle timeframe from standalone /timeframe (outside settings)."""
-    from config import TIMEFRAME_PRESETS
+    from core.config import TIMEFRAME_PRESETS
 
     query = update.callback_query
     await query.answer()
