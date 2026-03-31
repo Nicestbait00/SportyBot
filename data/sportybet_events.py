@@ -347,7 +347,7 @@ def filter_events(
     from datetime import datetime, timedelta
 
     # Lazy import to avoid circular dependency
-    from config import LEAGUE_SPORTYBET_NAMES, TIMEFRAME_PRESETS
+    from core.config import LEAGUE_SPORTYBET_NAMES, TIMEFRAME_PRESETS
 
     now = datetime.now()
     now_ts = now.timestamp() * 1000  # SportyBet uses ms timestamps

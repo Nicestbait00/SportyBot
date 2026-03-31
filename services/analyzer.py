@@ -831,7 +831,7 @@ def _search_team_id(team_name: str) -> int | None:
     if team_name in _team_id_cache:
         return _team_id_cache[team_name]
 
-    from config import API_FOOTBALL_KEY, API_FOOTBALL_BASE, CACHE_DIR
+    from core.config import API_FOOTBALL_KEY, API_FOOTBALL_BASE, CACHE_DIR
     import json
     import hashlib
     import time

@@ -1174,7 +1174,7 @@ async def _pick_analyze_from_message(message, context, target: float):
             return await _pick_build_combo(message, context)
 
         # Resolve friendly names for display
-        from config import LEAGUE_NAMES, TIMEFRAME_PRESETS
+        from core.config import LEAGUE_NAMES, TIMEFRAME_PRESETS
         league_display = ", ".join(LEAGUE_NAMES.get(lid, str(lid)) for lid in leagues) if leagues else "All leagues"
         timeframe_display = TIMEFRAME_PRESETS.get(timeframe, {}).get("label", timeframe)
 
@@ -1194,7 +1194,7 @@ async def _pick_analyze_from_message(message, context, target: float):
 
         # Step 1: Get fixtures directly from SportyBet (has event IDs + real odds)
         # Build tournament name filter from user's league config
-        from config import LEAGUE_SPORTYBET_NAMES
+        from core.config import LEAGUE_SPORTYBET_NAMES
         allowed_tournaments = None
         if leagues:
             allowed_tournaments = []
@@ -2568,7 +2568,7 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cleared += 1
 
     # 3. Re-fetch from SportyBet with user's league filter
-    from config import LEAGUE_SPORTYBET_NAMES
+    from core.config import LEAGUE_SPORTYBET_NAMES
     allowed_tournaments = []
     for lid in leagues:
         allowed_tournaments.extend(LEAGUE_SPORTYBET_NAMES.get(lid, []))
@@ -3718,7 +3718,7 @@ async def check_expand_callback(update: Update, context: ContextTypes.DEFAULT_TY
         code_matches.add(f"{p.get('home', '').lower()}_{p.get('away', '').lower()}")
 
     # Fetch SportyBet events for user's leagues
-    from config import LEAGUE_SPORTYBET_NAMES
+    from core.config import LEAGUE_SPORTYBET_NAMES
     tournament_filters = []
     for lid in leagues:
         tournament_filters.extend(LEAGUE_SPORTYBET_NAMES.get(lid, []))
