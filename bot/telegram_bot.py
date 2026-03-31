@@ -3554,175 +3554,38 @@ async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
                 _get_team_results_cached(context, away_name, count=10),
             )
 
-            home_form = _summarize_form(home_results) if home_results else None
-            away_form = _summarize_form(away_results) if away_results else None
-
-            event_id = pick.get("event_id", "")
-            if sporty_event:
-                event_id = sporty_event.get("eventId", event_id)
-            markets = sporty_event.get("markets", {}) if sporty_event else {}
-
-            base_pick = {
+            # Use the same scoring pipeline as /pick
+            ev = sporty_event or {
                 "home": home_name,
                 "away": away_name,
-                "league": pick.get("tournament", ""),
-                "date": "",
-                "match_status": pick.get("match_status", "Upcoming"),
-                "is_winning": pick.get("is_winning"),
-                "score": pick.get("score", ""),
-                "event_id": event_id,
+                "eventId": pick.get("event_id", ""),
+                "markets": {},
+            }
+
+            # Tag booking code metadata onto the event for downstream use
+            ev.setdefault("_booking_meta", {
                 "selection": pick.get("selection", {}),
-                "tournament": pick.get("tournament", ""),
-                "_source": "booking_code",
-                "_sporty_event": sporty_event,
                 "_original_pick": pick.get("pick", ""),
                 "_original_market": pick.get("market", ""),
                 "_original_odds": pick.get("odds", 1.0),
-            }
+            })
 
-            if home_form and away_form:
-                data_quality = "good"
-                scores = score_match(home_form, away_form, home_results, away_results)
+            match_scored = _score_fixture(ev, home_results, away_results)
 
-                def _get_odds_1x2(outcome_id: str) -> float:
-                    o = markets.get("1", {}).get("outcomes", {}).get(outcome_id, {})
-                    try:
-                        return float(o.get("odds", "0"))
-                    except (ValueError, TypeError):
-                        return 0.0
+            # Enrich each scored pick with booking code metadata
+            for sp in match_scored:
+                sp["_source"] = "booking_code"
+                sp["_sporty_event"] = sporty_event
+                sp["selection"] = pick.get("selection", {})
+                sp["_original_pick"] = pick.get("pick", "")
+                sp["_original_market"] = pick.get("market", "")
+                sp["_original_odds"] = pick.get("odds", 1.0)
+                sp["match_status"] = pick.get("match_status", "Upcoming")
+                sp["is_winning"] = pick.get("is_winning")
+                sp["score"] = pick.get("score", "")
 
-                def _get_over_odds(threshold: float) -> float:
-                    mkt = markets.get(f"18|total={threshold}", {})
-                    o12 = mkt.get("outcomes", {}).get("12", {})
-                    try:
-                        return float(o12.get("odds", "0"))
-                    except (ValueError, TypeError):
-                        return 0.0
-
-                def _get_gg_odds() -> float:
-                    o = markets.get("29", {}).get("outcomes", {}).get("74", {})
-                    try:
-                        return float(o.get("odds", "0"))
-                    except (ValueError, TypeError):
-                        return 0.0
-
-                def _verdict(conf: int) -> str:
-                    if conf >= 75:
-                        return "strong"
-                    elif conf >= 60:
-                        return "moderate"
-                    return "weak"
-
-                # Score ALL markets for this match (same as /pick)
-                match_scored = []
-
-                # Home Win
-                hw = scores["home_win"]
-                real_home_odds = _get_odds_1x2("1")
-                if real_home_odds > 1.0:
-                    checked = cross_check_with_odds(hw["confidence"], real_home_odds)
-                    conf = checked["confidence"]
-                    reasons = hw["reasons"][:]
-                    if checked["warning"]:
-                        reasons.append(checked["warning"])
-                    if conf >= 45:
-                        match_scored.append({
-                            **base_pick,
-                            "market": "1X2", "pick": "Home",
-                            "odds": real_home_odds,
-                            "confidence": conf, "data_confidence": conf,
-                            "verdict": _verdict(conf),
-                            "analysis_reasons": reasons,
-                            "suggestion": None, "data_quality": data_quality,
-                            "rating": "safe" if conf >= 70 else "moderate",
-                        })
-
-                # Away Win
-                aw = scores["away_win"]
-                real_away_odds = _get_odds_1x2("3")
-                if real_away_odds > 1.0:
-                    checked = cross_check_with_odds(aw["confidence"], real_away_odds)
-                    conf = checked["confidence"]
-                    reasons = aw["reasons"][:]
-                    if checked["warning"]:
-                        reasons.append(checked["warning"])
-                    if conf >= 45:
-                        match_scored.append({
-                            **base_pick,
-                            "market": "1X2", "pick": "Away",
-                            "odds": real_away_odds,
-                            "confidence": conf, "data_confidence": conf,
-                            "verdict": _verdict(conf),
-                            "analysis_reasons": reasons,
-                            "suggestion": None, "data_quality": data_quality,
-                            "rating": "safe" if conf >= 70 else "moderate",
-                        })
-
-                # Over 0.5 / 1.5 / 2.5
-                for threshold, key in [(0.5, "over_0.5"), (1.5, "over_1.5"), (2.5, "over_2.5")]:
-                    ov = scores[key]
-                    real_odds = _get_over_odds(threshold)
-                    if real_odds > 1.0:
-                        checked = cross_check_with_odds(ov["confidence"], real_odds)
-                        conf = checked["confidence"]
-                        reasons = ov["reasons"][:]
-                        if checked["warning"]:
-                            reasons.append(checked["warning"])
-                        if conf >= 45:
-                            match_scored.append({
-                                **base_pick,
-                                "market": "Over/Under",
-                                "pick": f"Over (total={threshold})",
-                                "odds": real_odds,
-                                "confidence": conf, "data_confidence": conf,
-                                "verdict": _verdict(conf),
-                                "analysis_reasons": reasons,
-                                "suggestion": None, "data_quality": data_quality,
-                                "rating": "safe" if threshold <= 1.5 else "moderate",
-                            })
-
-                # BTTS
-                bt = scores["btts"]
-                gg_odds = _get_gg_odds()
-                if gg_odds > 1.0:
-                    checked = cross_check_with_odds(bt["confidence"], gg_odds)
-                    conf = checked["confidence"]
-                    reasons = bt["reasons"][:]
-                    if checked["warning"]:
-                        reasons.append(checked["warning"])
-                    if conf >= 45:
-                        match_scored.append({
-                            **base_pick,
-                            "market": "GG/NG", "pick": "GG",
-                            "odds": gg_odds,
-                            "confidence": conf, "data_confidence": conf,
-                            "verdict": _verdict(conf),
-                            "analysis_reasons": reasons,
-                            "suggestion": None, "data_quality": data_quality,
-                            "rating": "moderate",
-                        })
-
-                # Extended markets
-                _add_extended_picks(
-                    match_scored, scores, markets, base_pick,
-                    data_quality, _verdict,
-                )
-
-                all_scored.extend(match_scored)
-                analyzed_count += 1
-
-            else:
-                # No form data — keep original pick with odds-only confidence
-                pick["_source"] = "booking_code"
-                pick["data_confidence"] = pick.get("confidence", 50)
-                pick["verdict"] = _confidence_verdict(pick.get("confidence", 50))
-                pick["analysis_reasons"] = ["⚠ No form data — odds-only estimate"]
-                pick["suggestion"] = None
-                pick["data_quality"] = "limited"
-                pick["event_id"] = event_id
-                pick["_sporty_event"] = sporty_event
-                all_scored.append(pick)
-                analyzed_count += 1
+            all_scored.extend(match_scored)
+            analyzed_count += 1
 
         except Exception as e:
             logger.exception("Check analysis failed for %s vs %s", home_name, away_name)
@@ -3984,7 +3847,7 @@ async def check_expand_callback(update: Update, context: ContextTypes.DEFAULT_TY
             # Extended markets
             _add_extended_picks(
                 league_scored, scores, markets, base_pick,
-                "good", _verdict,
+                "good",
             )
 
             code_matches.add(match_key)
