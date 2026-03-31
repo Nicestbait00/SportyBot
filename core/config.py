@@ -320,10 +320,18 @@ def get_market_category(market_name: str) -> str:
 # Default enabled markets for new users
 DEFAULT_ENABLED_MARKETS = [
     "1X2",
+    "Double Chance",
     "Over/Under",
     "GG/NG",
     "Home Over/Under",
     "Away Over/Under",
+    "1X2 & Over/Under",
+    "Home Or Over",
+    "Draw Or Over",
+    "Away Or Over",
+    "Home Or GG",
+    "Draw Or GG",
+    "Away Or GG",
 ]
 
 # Legacy strategy presets — kept for backward compatibility with saved configs
@@ -430,13 +438,13 @@ USER_CONFIG_DIR: Path = Path(__file__).resolve().parent / ".config"
 LEAGUE_NAMES: dict[int, str] = dict(LEAGUE_DISPLAY_NAMES)
 
 DEFAULT_USER_CONFIG = {
-    "leagues": [39, 140, 135, 78, 61],  # Top 5 European leagues
+    "leagues": [39, 140, 135, 78, 61, 40, 140, 135, 94, 78, 88, 61, 2, 3],  # Top 5 European leagues
     "strategy": "balanced",  # Legacy — kept for migration
-    "min_confidence": 75,    # New config: 0-100
-    "min_odds": 1.05,        # New config: minimum odds per pick
+    "min_confidence": 70,    # New config: 0-100
+    "min_odds": 1.15,        # New config: minimum odds per pick
     "enabled_markets": list(DEFAULT_ENABLED_MARKETS),  # New config: toggled markets
     "days_ahead": 14,
-    "timeframe": "7days",  # Default timeframe preset
+    "timeframe": "14days",  # Default timeframe preset
     "telegram_chat_ids": [],
 }
 
