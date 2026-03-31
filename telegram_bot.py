@@ -4440,6 +4440,28 @@ async def handle_natural_language(update: Update, context: ContextTypes.DEFAULT_
         )
         return ConversationHandler.END
 
+    elif intent == "split":
+        # Route to chat agent — it has the split_ticket tool
+        chat_id = update.effective_chat.id
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception:
+            pass
+        try:
+            response = await chat_agent.agent_respond(user_text, context.user_data, chat_id)
+            if response and response.strip():
+                await send_long_message(update, response)
+            else:
+                await update.message.reply_text(
+                    "I couldn't process that. Try /split with a booking code."
+                )
+        except Exception as e:
+            logger.warning(f"Split agent error: {e}")
+            await update.message.reply_text(
+                "Something went wrong. Try /split with a booking code instead."
+            )
+        return ConversationHandler.END
+
     elif intent == "stats":
         team = params.get("team", "").strip()
         if not team:

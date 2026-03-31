@@ -21,6 +21,7 @@ import requests
 
 from analysis_service import score_fixture
 from booking_service import fetch_booking_code, parse_outcomes
+import ticket_splitter
 from config import (
     DEFAULT_ENABLED_MARKETS,
     LEAGUE_NAMES,
@@ -182,6 +183,55 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "object",
             "properties": {},
+        },
+    },
+    {
+        "name": "split_ticket",
+        "description": (
+            "Split a SportyBet booking code into multiple smaller tickets. "
+            "Fetches the code, partitions picks into N tickets targeting specified odds. "
+            "Safest picks fill the smallest target first, and safe 'insurance' picks are "
+            "duplicated into riskier tickets. Use when user says 'split this ticket', "
+            "'break it into X tickets', or similar."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "SportyBet booking code to split",
+                },
+                "num_tickets": {
+                    "type": "integer",
+                    "description": "Number of tickets to split into (2-5)",
+                },
+                "target_odds": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": (
+                        "Target odds per ticket as a list of numbers, e.g. [10, 20, 50]. "
+                        "Must have exactly num_tickets values, each > 1.0."
+                    ),
+                },
+            },
+            "required": ["code", "num_tickets", "target_odds"],
+        },
+    },
+    {
+        "name": "book_split_ticket",
+        "description": (
+            "Book one of the split tickets from a previous split_ticket call. "
+            "Specify which ticket number to book (1-indexed)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ticket_num": {
+                    "type": "integer",
+                    "description": "Which ticket to book (1 = first, 2 = second, etc.)",
+                },
+            },
+            "required": ["ticket_num"],
         },
     },
 ]
@@ -656,6 +706,136 @@ async def _tool_book_ticket(user_data: dict) -> dict:
     }
 
 
+async def _tool_split_ticket(args: dict, user_data: dict) -> dict:
+    """Split a booking code into multiple smaller tickets."""
+    code = args.get("code", "").strip().upper()
+    num_tickets = int(args.get("num_tickets", 2))
+    targets = args.get("target_odds", [])
+
+    if not code or len(code) < 4:
+        return {"error": "Invalid booking code."}
+
+    # Ensure targets is a list of floats
+    try:
+        targets = [float(t) for t in targets]
+    except (ValueError, TypeError):
+        return {"error": "target_odds must be a list of numbers, e.g. [10, 20, 50]."}
+
+    if len(targets) != num_tickets:
+        return {"error": f"Expected {num_tickets} target odds but got {len(targets)}."}
+
+    # Fetch and parse the booking code
+    data = await asyncio.to_thread(fetch_booking_code, code)
+    if not data:
+        return {"error": f"Could not fetch code {code}. It may be expired or invalid."}
+
+    picks = parse_outcomes(data)
+    active_picks = [p for p in picks if p.get("match_status") != "Ended"]
+
+    if len(active_picks) < 2:
+        return {"error": f"Only {len(active_picks)} active pick(s) — need at least 2 to split."}
+
+    # Validate
+    err = ticket_splitter.validate_split_request(active_picks, targets)
+    if err:
+        return {"error": err}
+
+    # Run the split
+    result = ticket_splitter.split_ticket(active_picks, targets)
+
+    # Store for booking
+    user_data["agent_split_result"] = result
+
+    # Format for LLM consumption
+    tickets_out = []
+    for t in result["tickets"]:
+        picks_out = []
+        for p in t["picks"]:
+            picks_out.append({
+                "home": p["home"], "away": p["away"],
+                "market": p["market"], "pick": p["pick"],
+                "odds": round(float(p.get("odds", 1.0)), 2),
+            })
+        insurance_out = []
+        for p in t["insurance_picks"]:
+            insurance_out.append({
+                "home": p["home"], "away": p["away"],
+                "market": p["market"], "pick": p["pick"],
+                "odds": round(float(p.get("odds", 1.0)), 2),
+                "insurance": True,
+            })
+        tickets_out.append({
+            "ticket_num": t["ticket_num"],
+            "target_odds": t["target_odds"],
+            "actual_odds": t["actual_odds"],
+            "total_odds": t["total_odds"],
+            "pick_count": t["pick_count"],
+            "picks": picks_out,
+            "insurance_picks": insurance_out,
+        })
+
+    ended_count = len(picks) - len(active_picks)
+    return {
+        "code": code,
+        "original_total_odds": result["total_original_odds"],
+        "active_picks": len(active_picks),
+        "ended_excluded": ended_count,
+        "tickets": tickets_out,
+        "note": (
+            "Insurance picks (marked with insurance: true) are safe picks duplicated "
+            "from the safest pool into riskier tickets. The user can ask to remove them. "
+            "Present each ticket clearly and ask if they want to book any."
+        ),
+    }
+
+
+async def _tool_book_split_ticket(args: dict, user_data: dict) -> dict:
+    """Book one ticket from a previous split."""
+    result = user_data.get("agent_split_result")
+    if not result:
+        return {"error": "No split result found. Run split_ticket first."}
+
+    ticket_num = int(args.get("ticket_num", 0))
+    tickets = result.get("tickets", [])
+
+    if ticket_num < 1 or ticket_num > len(tickets):
+        return {"error": f"Invalid ticket number. Choose 1 to {len(tickets)}."}
+
+    ticket = tickets[ticket_num - 1]
+    all_picks = ticket["picks"] + ticket["insurance_picks"]
+
+    selections = []
+    for pick in all_picks:
+        sel = pick.get("selection", {})
+        if not sel or not sel.get("eventId"):
+            continue
+        selections.append({
+            "eventId": sel["eventId"],
+            "marketId": str(sel.get("marketId", "")),
+            "outcomeId": str(sel.get("outcomeId", "")),
+            "specifier": sel.get("specifier", ""),
+        })
+
+    if not selections:
+        return {"error": "No bookable selections in this ticket. Picks may have expired."}
+
+    try:
+        code = await asyncio.to_thread(create_booking_code, selections)
+    except Exception as e:
+        logger.warning(f"Split booking failed: {e}")
+        code = None
+
+    if code:
+        return {
+            "booking_code": code,
+            "ticket_num": ticket_num,
+            "odds": ticket["total_odds"],
+            "pick_count": ticket["pick_count"],
+        }
+    else:
+        return {"error": f"Booking failed for ticket {ticket_num}. SportyBet API may be down."}
+
+
 # ── Pick config helper (mirrors telegram_bot._get_pick_config) ───────────────
 
 def _get_pick_config(user_config: dict) -> dict:
@@ -688,6 +868,10 @@ async def _execute_tool(name: str, args: dict, user_data: dict, chat_id: int) ->
             return await _tool_explain_pick(args)
         elif name == "book_ticket":
             return await _tool_book_ticket(user_data)
+        elif name == "split_ticket":
+            return await _tool_split_ticket(args, user_data)
+        elif name == "book_split_ticket":
+            return await _tool_book_split_ticket(args, user_data)
         else:
             return {"error": f"Unknown tool: {name}"}
     except Exception as e:

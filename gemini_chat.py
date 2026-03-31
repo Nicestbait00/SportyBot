@@ -28,7 +28,7 @@ You do NOT make pick decisions — the deterministic scoring engine handles that
 
 Return a JSON object (no markdown fences, no extra text) with these fields:
 {
-  "intent": "<one of: pick, check, leagues, timeframe, stats, chat>",
+  "intent": "<one of: pick, check, split, leagues, timeframe, stats, chat>",
   "params": { ... },
   "reply": "A short conversational message to show the user"
 }
@@ -59,6 +59,11 @@ Intent definitions:
   params — empty {}
 - "stats": The user is asking about a specific team's form, results, or stats.
   params.team (string) — the team name
+- "split": The user wants to split a booking code into smaller tickets.
+  Triggered by: "split this ticket", "break ABC123 into 3", "divide my ticket", "split into 2 tickets at 10,20 odds"
+  params.code (string or null) — the booking code if provided
+  params.num_tickets (int or null) — how many tickets to split into (2-5)
+  params.target_odds (list of floats or null) — target odds per ticket, e.g. [10, 20, 50]
 - "chat": General football chat, greetings, questions about how the bot works, etc.
   params — empty {}
 
@@ -207,7 +212,7 @@ def chat(message: str, context: dict = None) -> dict:
         return _fallback_parse(message)
 
     return _parse_json_response(
-        raw, {"pick", "check", "leagues", "timeframe", "stats", "chat"}
+        raw, {"pick", "check", "split", "leagues", "timeframe", "stats", "chat"}
     )
 
 
@@ -423,6 +428,14 @@ def _fallback_parse(message: str) -> dict:
                 "market_slots": market_slots,
             },
             "reply": f"Looking for picks{' at ' + str(target) + ' odds' if target else ''}...",
+        }
+
+    if any(kw in msg for kw in ("split", "break", "divide", "partition")):
+        code_match_split = re.search(r"\b([A-Z0-9]{6,10})\b", message.strip())
+        return {
+            "intent": "split",
+            "params": {"code": code_match_split.group(1) if code_match_split else None},
+            "reply": "Let me split that ticket for you.",
         }
 
     code_match = re.search(r"\b([A-Za-z0-9]{6,10})\b", msg)
