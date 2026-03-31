@@ -3963,7 +3963,7 @@ async def handle_natural_language(update: Update, context: ContextTypes.DEFAULT_
     """Fallback handler for free-text messages not caught by commands or conversations."""
     user_text = update.message.text
     if not user_text or not user_text.strip():
-        return
+        return ConversationHandler.END
 
     # Build context for Gemini
     chat_id = update.effective_chat.id if update.effective_chat else None
@@ -3980,7 +3980,7 @@ async def handle_natural_language(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.warning(f"Gemini chat error: {e}")
         await update.message.reply_text(
-            "Sorry, I couldn't process that. Try /pick, /check, or /leagues."
+            "Sorry, I couldn't process that. Try /pick, /check, or /chat."
         )
         return ConversationHandler.END
 
@@ -4036,13 +4036,15 @@ async def handle_natural_language(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
     elif intent == "leagues":
-        await update.message.reply_text(reply)
-        await cmd_leagues(update, context)
+        await update.message.reply_text(
+            f"{reply}\n\nUse /settings to configure your leagues."
+        )
         return ConversationHandler.END
 
     elif intent == "timeframe":
-        await update.message.reply_text(reply)
-        await cmd_timeframe(update, context)
+        await update.message.reply_text(
+            f"{reply}\n\nUse /settings to configure your timeframe."
+        )
         return ConversationHandler.END
 
     elif intent == "stats":
@@ -4100,13 +4102,24 @@ async def handle_natural_language(update: Update, context: ContextTypes.DEFAULT_
     else:
         # intent == "chat" or unknown — route to agent for richer response
         chat_id = update.effective_chat.id
-        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception:
+            pass
         try:
             response = await chat_agent.agent_respond(user_text, context.user_data, chat_id)
-            await send_long_message(update, response)
+            if response and response.strip():
+                await send_long_message(update, response)
+            elif reply and reply.strip():
+                await update.message.reply_text(reply)
+            else:
+                await update.message.reply_text(
+                    "I'm here! Try /pick for picks, /check to analyze a code, or /chat to ask me anything."
+                )
         except Exception as e:
             logger.warning(f"Agent error: {e}")
-            await update.message.reply_text(reply)  # fall back to Gemini's short reply
+            fallback = reply if reply and reply.strip() else "Something went wrong. Try /pick or /check."
+            await update.message.reply_text(fallback)
         return ConversationHandler.END
 
 
@@ -4116,7 +4129,7 @@ async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if rl_msg:
         await update.message.reply_text(rl_msg)
         return
-    user_text = update.message.text
+    user_text = update.message.text or ""
     if user_text.startswith("/chat"):
         user_text = user_text[5:].strip()
     if not user_text:
@@ -4128,10 +4141,16 @@ async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     context.user_data["chat_id"] = chat_id
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception:
+        pass
     try:
         response = await chat_agent.agent_respond(user_text, context.user_data, chat_id)
-        await send_long_message(update, response)
+        if response and response.strip():
+            await send_long_message(update, response)
+        else:
+            await update.message.reply_text("I couldn't generate a response. Try rephrasing or use /pick.")
     except Exception as e:
         logger.warning(f"Chat agent error: {e}")
         await update.message.reply_text("I hit a snag processing that. Try again in a moment.")
