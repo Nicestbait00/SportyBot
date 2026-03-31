@@ -12,7 +12,7 @@ import math
 from itertools import combinations
 from typing import Any, Optional
 
-from data_collector import (
+from data.data_collector import (
     get_head_to_head,
     get_standings,
     get_team_form,

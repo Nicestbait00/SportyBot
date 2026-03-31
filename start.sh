@@ -1,4 +1,4 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")"
-exec python3 telegram_bot.py
+exec python3 main.py

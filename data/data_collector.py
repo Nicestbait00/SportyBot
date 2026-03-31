@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 import requests
 
-from config import (
+from core.config import (
     API_FOOTBALL_BASE, API_FOOTBALL_KEY, CACHE_DIR, CACHE_TTL_SECONDS,
     FOOTBALL_DATA_BASE, FOOTBALL_DATA_KEY, LEAGUE_TO_FD_CODE,
 )

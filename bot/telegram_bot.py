@@ -28,12 +28,12 @@ from telegram.ext import (
     filters,
 )
 
-# Add project root to path so imports work
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add project root to path so package imports work
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
-from config import (
+from core.config import (
     AVAILABLE_MARKETS,
     DEFAULT_ENABLED_MARKETS,
     LEAGUE_CATEGORIES,
@@ -43,22 +43,22 @@ from config import (
     load_user_config,
     save_user_config,
 )
-from data_collector import get_api_budget, get_fixtures, get_fixtures_lookahead, refresh_all
-from analyzer import find_best_combo
-from web_analyzer import analyze_pick as web_analyze_pick, get_team_results, _summarize_form, _poisson_over_prob
-from scorer import score_match, cross_check_with_odds
-import gemini_chat
-import chat_agent
-import ticket_engine
-import ticket_splitter
-from booking_service import fetch_booking_code, parse_outcomes
-from analysis_service import (
+from data.data_collector import get_api_budget, get_fixtures, get_fixtures_lookahead, refresh_all
+from services.analyzer import find_best_combo
+from data.web_analyzer import analyze_pick as web_analyze_pick, get_team_results, _summarize_form, _poisson_over_prob
+from core.scorer import score_match, cross_check_with_odds
+from services import gemini_chat
+from services import chat_agent
+from services import ticket_engine
+from services import ticket_splitter
+from data.booking_service import fetch_booking_code, parse_outcomes
+from services.analysis_service import (
     add_extended_picks as _add_extended_picks,
     add_thin_data_safe_picks as _add_thin_data_safe_picks,
     score_fixture as _score_fixture,
     verdict as _verdict,
 )
-from ticket_engine import (
+from services.ticket_engine import (
     confidence_verdict as _confidence_verdict,
     pick_key as _pick_key,
     pick_threshold as _pick_threshold,
@@ -77,7 +77,7 @@ from ticket_engine import (
     generate_dynamic_bundle as _generate_dynamic_bundle,
     generate_unique_bundle as _generate_unique_bundle,
 )
-from sportybet_events import (
+from data.sportybet_events import (
     build_event_index, clear_cache as clear_sportybet_cache,
     fetch_all_events, filter_events, find_event,
     build_booking_selection, create_booking_code,

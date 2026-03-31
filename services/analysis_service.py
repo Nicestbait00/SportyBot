@@ -9,8 +9,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from scorer import score_match, cross_check_with_odds
-from web_analyzer import _summarize_form
+from core.scorer import score_match, cross_check_with_odds
+from data.web_analyzer import _summarize_form
 
 logger = logging.getLogger(__name__)
 

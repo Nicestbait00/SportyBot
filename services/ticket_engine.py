@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import random
 
-from config import DEFAULT_ENABLED_MARKETS
+from core.config import DEFAULT_ENABLED_MARKETS
 
 
 # ── Pick helpers ──────────────────────────────────────────────────────────────

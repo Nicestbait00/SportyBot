@@ -1,5 +1,6 @@
 .env
 __pycache__/
+**/__pycache__/
 *.pyc
 .cache/
 bot.log
@@ -10,3 +11,10 @@ openclaw.config.json
 openclaw.config.json.save
 user_config.json
 .config/
+=21.0
+AGENTS.md
+browser_tool.py
+package.json
+package-lock.json
+sportybet-browser
+sportybot.py

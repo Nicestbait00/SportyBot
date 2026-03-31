@@ -19,30 +19,30 @@ from datetime import datetime
 
 import requests
 
-from analysis_service import score_fixture
-from booking_service import fetch_booking_code, parse_outcomes
-import ticket_splitter
-from config import (
+from services.analysis_service import score_fixture
+from data.booking_service import fetch_booking_code, parse_outcomes
+from services import ticket_splitter
+from core.config import (
     DEFAULT_ENABLED_MARKETS,
     LEAGUE_NAMES,
     LEAGUE_SPORTYBET_NAMES,
     STRATEGY_PRESETS,
     load_user_config,
 )
-from scorer import score_match, cross_check_with_odds
-from sportybet_events import (
+from core.scorer import score_match, cross_check_with_odds
+from data.sportybet_events import (
     build_booking_selection,
     create_booking_code,
     fetch_all_events,
     filter_events,
     find_event,
 )
-from ticket_engine import (
+from services.ticket_engine import (
     build_qualified_pool,
     make_ticket_entry,
     select_ticket_from_pool,
 )
-from web_analyzer import get_team_results, _summarize_form
+from data.web_analyzer import get_team_results, _summarize_form
 
 logger = logging.getLogger(__name__)
 
