@@ -353,6 +353,11 @@ def sportsdb_get_last_results(team_id: str) -> list[dict]:
 
 # ── Unified team data fetcher ────────────────────────────────────────────────
 
+def _normalise(n: str) -> str:
+    """Normalize team name for caching."""
+    return _strip_suffix(n).lower().strip()
+
+
 def get_team_results(team_name: str, count: int = 10) -> list[dict]:
     """
     Get recent results for a team. Tries sources in order:
@@ -364,10 +369,6 @@ def get_team_results(team_name: str, count: int = 10) -> list[dict]:
     Results are MERGED and deduplicated if multiple sources return data,
     giving the most complete picture possible.
     """
-  # Normalise name before building the cache key
-def _normalise(n: str) -> str:
-    return _strip_suffix(n).lower().strip()
-
     # Top-level cache: avoid re-running source lookups for the same team (12h TTL)
     top_key = _cache_key("team_results", f"{_normalise(team_name)}_{count}")
     cached = _cache_get(top_key, ttl=43200)
@@ -395,8 +396,8 @@ def _normalise(n: str) -> str:
     # Always try — _api_get() returns cached data without using budget.
     # Only a cache MISS would trigger a live API call (which checks budget internally).
     try:
-        from data_collector import get_team_form
-        from analyzer import _search_team_id
+        from data.data_collector import get_team_form
+        from services.analyzer import _search_team_id
         af_id = _search_team_id(team_name)
         if af_id:
             af_form = get_team_form(af_id, last_n=5)
@@ -529,58 +530,59 @@ def analyze_pick(pick: dict) -> dict:
         reasons.insert(0, f"📊 Good data — {total_results} recent matches analyzed")
 
     # Score the pick — use score_match() (same scorer as /pick)
-if home_form or away_form:    
-    scored = score_match(
-        home_form or {},
-        away_form or {},
-        home_results,    # already fetched above
-        away_results,    # already fetched above
-    )
-    mk = market.lower()
-    pk = pick_desc.lower()
-    scored_key = None
+    confidence = 50  # default
+    if home_form or away_form:
+        scored = score_match(
+            home_form or {},
+            away_form or {},
+            home_results,    # already fetched above
+            away_results,    # already fetched above
+        )
+        mk = market.lower()
+        pk = pick_desc.lower()
+        scored_key = None
 
-    if "1x2" in mk or "match result" in mk or "winner" in mk:
-        if "home" in pk or pk.strip() == "1":
-            scored_key = "home_win"
-        elif "away" in pk or pk.strip() == "2":
-            scored_key = "away_win"
-        elif "draw" in pk or pk.strip() == "x":
-            scored_key = "draw"
+        if "1x2" in mk or "match result" in mk or "winner" in mk:
+            if "home" in pk or pk.strip() == "1":
+                scored_key = "home_win"
+            elif "away" in pk or pk.strip() == "2":
+                scored_key = "away_win"
+            elif "draw" in pk or pk.strip() == "x":
+                scored_key = "draw"
 
-    elif "over" in pk or "under" in pk:
-        for line in ["0.5", "1.5", "2.5", "3.5"]:
-            if line in pk:
-                if "under" in pk:
-                    r = scored.get(f"over_{line}", {})
-                    confidence = 100 - r.get("confidence", 50)
-                    reasons.extend(r.get("reasons", [])[:3])
-                else:
-                    scored_key = f"over_{line}"
-                break
+        elif "over" in pk or "under" in pk:
+            for line in ["0.5", "1.5", "2.5", "3.5"]:
+                if line in pk:
+                    if "under" in pk:
+                        r = scored.get(f"over_{line}", {})
+                        confidence = 100 - r.get("confidence", 50)
+                        reasons.extend(r.get("reasons", [])[:3])
+                    else:
+                        scored_key = f"over_{line}"
+                    break
 
-    elif "gg" in mk or "btts" in mk or "both" in mk:
-        if "yes" in pk or "gg" in pk:
-            scored_key = "btts"
-        else:
-            r = scored.get("btts", {})
-            confidence = 100 - r.get("confidence", 50)
-            reasons.extend(r.get("reasons", [])[:3])
+        elif "gg" in mk or "btts" in mk or "both" in mk:
+            if "yes" in pk or "gg" in pk:
+                scored_key = "btts"
+            else:
+                r = scored.get("btts", {})
+                confidence = 100 - r.get("confidence", 50)
+                reasons.extend(r.get("reasons", [])[:3])
 
-    elif "double chance" in mk:
-        if "1x" in pk:   scored_key = "double_chance_1x"
-        elif "x2" in pk: scored_key = "double_chance_x2"
-        elif "12" in pk:  scored_key = "double_chance_12"
+        elif "double chance" in mk:
+            if "1x" in pk:    scored_key = "double_chance_1x"
+            elif "x2" in pk:  scored_key = "double_chance_x2"
+            elif "12" in pk:  scored_key = "double_chance_12"
 
-    if scored_key and scored_key in scored:
-        confidence = scored[scored_key]["confidence"]
-        reasons.extend(scored[scored_key]["reasons"][:3])
-    elif scored_key is not None:
-        # market wasn't mapped — safe fallback
-        confidence = _score_pick(market, pick_desc, odds, home_name, away_name,
-                                 home_form, away_form, reasons)
-else:    
-    confidence = _odds_to_confidence(odds)        
+        if scored_key and scored_key in scored:
+            confidence = scored[scored_key]["confidence"]
+            reasons.extend(scored[scored_key]["reasons"][:3])
+        elif scored_key is not None:
+            # market wasn't mapped — safe fallback
+            confidence = _score_pick(market, pick_desc, odds, home_name, away_name,
+                                     home_form, away_form, reasons)
+    else:
+        confidence = _odds_to_confidence(odds)
 
     # When data is poor, DO NOT silently fall back to odds-based estimates.
     # Instead, mark clearly so the user can decide.
