@@ -38,7 +38,7 @@ from services.ticket_splitter import (
     format_split_summary,
     format_single_ticket,
 )
-from core.config import SPORTYBET_TOKEN
+from core import config  # noqa: F401 — ensure env is loaded
 
 logger = logging.getLogger(__name__)
 

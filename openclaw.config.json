@@ -31,7 +31,6 @@
         "env": {
           "API_FOOTBALL_KEY": "${API_FOOTBALL_KEY}",
           "FOOTBALL_DATA_KEY": "${FOOTBALL_DATA_KEY}",
-          "SPORTYBET_TOKEN": "${SPORTYBET_TOKEN}",
           "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"
         }
       }
