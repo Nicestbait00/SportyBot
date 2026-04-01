@@ -1,0 +1,46 @@
+{
+  "env": {
+    "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openrouter/anthropic/claude-sonnet-4-5",
+        "fallback": "openrouter/anthropic/claude-haiku-3.5"
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "${TELEGRAM_BOT_TOKEN}",
+      "dmPolicy": "open",
+      "groups": {
+        "*": {
+          "requireMention": true
+        }
+      }
+    }
+  },
+  "mcp": {
+    "servers": {
+      "sportybot": {
+        "command": "python3",
+        "args": ["-m", "mcp_server"],
+        "cwd": "/app",
+        "env": {
+          "API_FOOTBALL_KEY": "${API_FOOTBALL_KEY}",
+          "FOOTBALL_DATA_KEY": "${FOOTBALL_DATA_KEY}",
+          "SPORTYBET_TOKEN": "${SPORTYBET_TOKEN}",
+          "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"
+        }
+      }
+    }
+  },
+  "tools": {
+    "allow": [
+      "group:mcp"
+    ]
+  },
+  "workspace": "/app"
+}
