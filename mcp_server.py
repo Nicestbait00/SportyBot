@@ -44,10 +44,7 @@ logger = logging.getLogger(__name__)
 
 # ── MCP Server ───────────────────────────────────────────────────────────────
 
-mcp = FastMCP(
-    "sportybot",
-    description="SportyBot — football betting analysis, ticket building, and splitting tools",
-)
+mcp = FastMCP("sportybot")
 
 
 # ─── Booking Code Tools ─────────────────────────────────────────────────────
@@ -99,17 +96,32 @@ def create_booking(selections: list[dict]) -> dict:
 
 @mcp.tool()
 def list_events(
-    timeframe: str = "7days",
+    timeframe: str | None = None,
     league: str | None = None,
 ) -> dict:
     """List upcoming football events from SportyBet.
 
+    Respects user's configured leagues and timeframe by default.
+
     Args:
-        timeframe: "today", "tomorrow", "weekend", "7days", or "14days"
-        league: Optional league filter like "Premier League", "La Liga"
+        timeframe: Override: "today", "tomorrow", "weekend", "7days", "14days"
+        league: Optional extra filter like "Premier League", "La Liga"
     """
-    events = fetch_all_events(max_pages=10)
-    filtered = filter_events(events, timeframe=timeframe)
+    from core.config import load_user_config, LEAGUE_SPORTYBET_NAMES
+
+    user_cfg = load_user_config()
+    cfg_timeframe = timeframe or user_cfg.get("timeframe", "7days")
+    cfg_leagues = user_cfg.get("leagues", [])
+
+    allowed_tournaments = []
+    for lid in cfg_leagues:
+        allowed_tournaments.extend(LEAGUE_SPORTYBET_NAMES.get(lid, []))
+
+    events = fetch_all_events(
+        max_pages=15,
+        allowed_tournaments=allowed_tournaments or None,
+    )
+    filtered = filter_events(events, timeframe=cfg_timeframe)
     if league:
         league_lower = league.lower()
         filtered = [
@@ -232,22 +244,37 @@ def score_match(
 def build_ticket(
     ticket_count: int = 1,
     target_odds: str = "5.0",
-    timeframe: str = "7days",
+    timeframe: str | None = None,
     league: str | None = None,
 ) -> dict:
     """Build dynamic betting ticket(s) using the analysis engine.
 
-    Scores all available fixtures, selects the best picks to hit
-    the target odds with safety-first approach.
+    Loads user config for leagues, min_confidence, min_odds, enabled_markets.
+    Only scores fixtures matching the user's configured leagues and timeframe.
 
     Args:
         ticket_count: Number of tickets to generate (1-5)
         target_odds: Target odds per ticket. Single number "10" or
                      comma-separated "5,10,25" for per-ticket targets.
-        timeframe: "today", "tomorrow", "weekend", "7days", "14days"
-        league: Optional league filter
+        timeframe: Override timeframe. Default uses user config.
+        league: Optional extra league filter (name, e.g. "Premier League")
     """
-    from core.config import PICK_CONFIG
+    from core.config import load_user_config, LEAGUE_SPORTYBET_NAMES
+
+    # Load user config
+    user_cfg = load_user_config()
+    min_conf = user_cfg.get("min_confidence", 75)
+    min_odds = user_cfg.get("min_odds", 1.15)
+    enabled_markets = set(user_cfg.get("enabled_markets", []))
+    cfg_timeframe = timeframe or user_cfg.get("timeframe", "7days")
+    cfg_leagues = user_cfg.get("leagues", [])
+
+    # Build pick_cfg from user settings
+    pick_cfg = {
+        "min_confidence": min_conf,
+        "min_odds": min_odds,
+        "preferred_markets": list(enabled_markets),
+    }
 
     # Parse targets
     try:
@@ -263,9 +290,19 @@ def build_ticket(
 
     ticket_count = min(max(ticket_count, 1), 5)
 
-    # Fetch and score events
-    events = fetch_all_events(max_pages=10)
-    filtered = filter_events(events, timeframe=timeframe)
+    # Build allowed tournaments from user's league config
+    allowed_tournaments = []
+    for lid in cfg_leagues:
+        allowed_tournaments.extend(LEAGUE_SPORTYBET_NAMES.get(lid, []))
+
+    # Fetch only events matching user's leagues
+    events = fetch_all_events(
+        max_pages=15,
+        allowed_tournaments=allowed_tournaments or None,
+    )
+    filtered = filter_events(events, timeframe=cfg_timeframe)
+
+    # Extra league name filter if provided
     if league:
         league_lower = league.lower()
         filtered = [
@@ -273,6 +310,7 @@ def build_ticket(
             if league_lower in e.get("tournament", "").lower()
         ]
 
+    # Score fixtures
     all_scored = []
     for ev in filtered:
         home_results = get_team_results(ev.get("home", ""), 10)
@@ -280,10 +318,31 @@ def build_ticket(
         scored = score_fixture(ev, home_results, away_results)
         all_scored.extend(scored)
 
-    if not all_scored:
-        return {"error": "No scored picks available for the given filters."}
+    # Apply user filters: min_confidence, min_odds, enabled_markets
+    if enabled_markets:
+        all_scored = [
+            p for p in all_scored
+            if p.get("market") in enabled_markets
+        ]
+    all_scored = [
+        p for p in all_scored
+        if p.get("confidence", 0) >= min_conf
+        and float(p.get("odds", 0)) >= min_odds
+    ]
 
-    pick_cfg = PICK_CONFIG if "PICK_CONFIG" in dir() else {}
+    if not all_scored:
+        return {
+            "error": "No picks passed your filters.",
+            "config": {
+                "leagues": len(cfg_leagues),
+                "timeframe": cfg_timeframe,
+                "min_confidence": min_conf,
+                "min_odds": min_odds,
+                "enabled_markets": len(enabled_markets),
+                "events_found": len(filtered),
+            },
+        }
+
     tickets, profile, reused = generate_dynamic_bundle(
         all_scored, ticket_count, target, pick_cfg, set()
     )
