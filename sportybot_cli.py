@@ -95,6 +95,8 @@ def main():
         ),
         "config_get": lambda: _config_get(),
         "config_set": lambda: _config_set(kwargs),
+        "config_options": lambda: _config_options(),
+        "config_preset": lambda: _config_preset(kwargs.get("preset", "")),
     }
 
     if tool not in tools:
@@ -134,10 +136,73 @@ def _config_set(kwargs: dict):
             cfg["days_ahead"] = int(v)
         elif k == "enabled_markets":
             cfg["enabled_markets"] = v.split(",")
+        elif k == "strategy":
+            # Apply a named preset
+            return _config_preset(v)
         else:
             cfg[k] = v
     save_user_config(cfg)
     return {"status": "saved", "config": cfg}
+
+
+def _config_options():
+    from core.config import (
+        STRATEGY_PRESETS, LEAGUE_SPORTYBET_NAMES,
+        LEAGUE_DISPLAY_NAMES, DEFAULT_ENABLED_MARKETS,
+        TIMEFRAME_PRESETS, load_user_config,
+    )
+    current = load_user_config()
+    return {
+        "current_config": {
+            "leagues": current.get("leagues", []),
+            "timeframe": current.get("timeframe"),
+            "min_confidence": current.get("min_confidence"),
+            "min_odds": current.get("min_odds"),
+            "enabled_markets": current.get("enabled_markets", []),
+        },
+        "available_presets": {
+            name: {
+                "description": p["description"],
+                "min_confidence": p["min_confidence"],
+                "min_odds": p.get("min_odds"),
+                "markets": p["preferred_markets"],
+            }
+            for name, p in STRATEGY_PRESETS.items()
+        },
+        "available_leagues": {
+            str(lid): name
+            for lid, name in LEAGUE_DISPLAY_NAMES.items()
+            if lid in LEAGUE_SPORTYBET_NAMES
+        },
+        "available_markets": list(DEFAULT_ENABLED_MARKETS),
+        "available_timeframes": list(TIMEFRAME_PRESETS.keys()),
+    }
+
+
+def _config_preset(preset_name: str):
+    from core.config import STRATEGY_PRESETS, load_user_config, save_user_config
+    preset_name = preset_name.lower().strip()
+    if preset_name not in STRATEGY_PRESETS:
+        return {
+            "error": f"Unknown preset '{preset_name}'",
+            "available": list(STRATEGY_PRESETS.keys()),
+        }
+    preset = STRATEGY_PRESETS[preset_name]
+    cfg = load_user_config()
+    cfg["min_confidence"] = preset["min_confidence"]
+    cfg["min_odds"] = preset.get("min_odds", 1.10)
+    cfg["enabled_markets"] = preset["preferred_markets"]
+    save_user_config(cfg)
+    return {
+        "status": "applied",
+        "preset": preset_name,
+        "description": preset["description"],
+        "config": {
+            "min_confidence": cfg["min_confidence"],
+            "min_odds": cfg["min_odds"],
+            "enabled_markets": cfg["enabled_markets"],
+        },
+    }
 
 
 if __name__ == "__main__":
