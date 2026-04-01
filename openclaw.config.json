@@ -29,7 +29,6 @@
         "args": ["-m", "mcp_server"],
         "cwd": "/app",
         "env": {
-          "API_FOOTBALL_KEY": "${API_FOOTBALL_KEY}",
           "FOOTBALL_DATA_KEY": "${FOOTBALL_DATA_KEY}",
           "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"
         }

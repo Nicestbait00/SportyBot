@@ -185,7 +185,7 @@ def analyze_booking_code(code: str) -> dict:
 def get_form_data(team: str, count: int = 10) -> dict:
     """Get recent match results for a team.
 
-    Pulls from football-data.org (primary) and thesportsdb (fallback).
+    Pulls from football-data.org (primary) and thesportsdb.com (fallback).
     Useful for checking form before placing bets.
 
     Args:
