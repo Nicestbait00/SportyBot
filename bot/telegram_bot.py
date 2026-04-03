@@ -100,6 +100,8 @@ PICK_TYPE, PICK_COUNT, PICK_ODDS, PICK_MODE, PICK_REVIEW, GAME_DIALOGUE = range(
 STRAT_CUSTOM_CONFIDENCE, STRAT_CUSTOM_MARKETS, STRAT_CUSTOM_OVER, STRAT_CUSTOM_MIN_ODDS, STRAT_LEAGUES, STRAT_TIMEFRAME = range(20, 26)
 # Conversation states for /split flow
 SPLIT_CODE, SPLIT_COUNT, SPLIT_TARGETS, SPLIT_CONFIRM = range(30, 34)
+# Conversation states for /sort flow
+SORT_CODE, SORT_MODE = range(40, 42)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -320,6 +322,180 @@ def format_analysis(result: dict) -> str:
     return "\n".join(lines)
 
 
+def fetch_booking_code(code: str) -> dict | None:
+    """Fetch and parse a single SportyBet booking code. Returns parsed data or None."""
+    import requests as req
+    try:
+        url = f"https://www.sportybet.com/api/ng/orders/share/{code}"
+        resp = req.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        data = resp.json()
+    except Exception:
+        return None
+
+    if data.get("bizCode") != 10000 or not data.get("data"):
+        return None
+
+    return data["data"]
+
+
+def parse_outcomes(data: dict) -> list[dict]:
+    """Parse SportyBet share data into a flat list of picks with ratings."""
+    outcomes = data.get("outcomes", [])
+    selections = data.get("ticket", {}).get("selections", [])
+
+    # Build selection lookup for specifiers
+    sel_map = {s["eventId"]: s for s in selections}
+
+    picks = []
+    for outcome in outcomes:
+        home = outcome.get("homeTeamName", "?")
+        away = outcome.get("awayTeamName", "?")
+        match_status = outcome.get("matchStatus", "?")
+        tournament = (
+            outcome.get("sport", {})
+            .get("category", {})
+            .get("tournament", {})
+            .get("name", "?")
+        )
+        event_id = outcome.get("eventId", "")
+
+        # Get market info
+        markets = outcome.get("markets", [])
+        market_desc = "?"
+        pick_desc = "?"
+        odds = 1.0
+        is_winning = None
+
+        if markets:
+            m = markets[0]
+            market_desc = m.get("desc", "?")
+            if m.get("outcomes"):
+                o = m["outcomes"][0]
+                pick_desc = o.get("desc", "?")
+                try:
+                    odds = float(o.get("odds", "1.0"))
+                except (ValueError, TypeError):
+                    odds = 1.0
+                is_winning = o.get("isWinning")
+
+        # Add specifier for Over/Under
+        sel = sel_map.get(event_id, {})
+        specifier = sel.get("specifier", "")
+        if specifier:
+            pick_desc = f"{pick_desc} ({specifier})"
+
+        # Rate the pick
+        if match_status == "Ended":
+            if is_winning == 1:
+                rating = "won"
+                confidence = 100
+            elif is_winning == 0:
+                rating = "lost"
+                confidence = 0
+            else:
+                rating = "void"
+                confidence = 50
+        else:
+            if odds < 1.25:
+                rating = "very_safe"
+                confidence = 90
+            elif odds < 1.40:
+                rating = "safe"
+                confidence = 80
+            elif odds < 1.60:
+                rating = "moderate"
+                confidence = 65
+            elif odds < 1.80:
+                rating = "medium"
+                confidence = 55
+            elif odds < 2.20:
+                rating = "risky"
+                confidence = 40
+            else:
+                rating = "very_risky"
+                confidence = 25
+
+        score_str = outcome.get("setScore", "")
+
+        picks.append({
+            "home": home,
+            "away": away,
+            "tournament": tournament,
+            "market": market_desc,
+            "pick": pick_desc,
+            "odds": odds,
+            "rating": rating,
+            "confidence": confidence,
+            "match_status": match_status,
+            "is_winning": is_winning,
+            "score": score_str,
+            "event_id": event_id,
+            "selection": sel,
+        })
+
+    return picks
+
+
+def _kickoff_ms_from_pick(pick: dict) -> int:
+    """Return the best-known kickoff timestamp in milliseconds for a pick."""
+    cached = pick.get("_sort_kickoff_ms")
+    if cached:
+        try:
+            return int(cached)
+        except (TypeError, ValueError):
+            pass
+
+    sporty_event = pick.get("_sporty_event") or {}
+    kickoff = sporty_event.get("estimateStartTime")
+    if kickoff:
+        try:
+            return int(kickoff)
+        except (TypeError, ValueError):
+            pass
+
+    date_str = pick.get("date", "")
+    if date_str:
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(date_str, fmt)
+                return int(dt.timestamp() * 1000)
+            except ValueError:
+                continue
+    return 0
+
+
+def _format_pick_kickoff(pick: dict) -> str:
+    """Format a pick kickoff for display."""
+    kickoff_ms = _kickoff_ms_from_pick(pick)
+    if kickoff_ms <= 0:
+        return "Unknown kickoff"
+    return datetime.fromtimestamp(kickoff_ms / 1000).strftime("%Y-%m-%d %H:%M")
+
+
+def _sort_booking_picks(picks: list[dict], mode: str) -> list[dict]:
+    """Sort already-selected booking picks without changing the selection itself."""
+
+    def _sort_key(pick: dict):
+        kickoff_ms = _kickoff_ms_from_pick(pick)
+        has_kickoff = 0 if kickoff_ms > 0 else 1
+        if kickoff_ms > 0:
+            dt = datetime.fromtimestamp(kickoff_ms / 1000)
+            if mode == "time":
+                primary = (dt.hour, dt.minute, dt.date().isoformat())
+            else:
+                primary = (dt.date().isoformat(), dt.hour, dt.minute)
+        else:
+            primary = ("9999-12-31", 99, 99)
+        return (
+            has_kickoff,
+            primary,
+            pick.get("tournament", pick.get("league", "")),
+            pick.get("home", ""),
+            pick.get("away", ""),
+            pick.get("market", ""),
+        )
+
+    return sorted([dict(p) for p in picks], key=_sort_key)
 def format_picks_review(all_picks: list[dict], codes: list[str]) -> str:
     """Format all picks from multiple codes into a review summary (basic, no deep analysis)."""
     lines = [f"Review: {len(all_picks)} games from {len(codes)} code(s)\n"]
@@ -712,6 +888,16 @@ def _clear_pick_runtime(context: ContextTypes.DEFAULT_TYPE) -> None:
         "pick_change_idx",
         "pick_change_alts",
         "_team_results_cache",
+    ]:
+        context.user_data.pop(key, None)
+
+
+def _clear_sort_runtime(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear transient /sort state."""
+    for key in [
+        "sort_code",
+        "sort_mode",
+        "sort_pending_picks",
     ]:
         context.user_data.pop(key, None)
 
@@ -3489,6 +3675,167 @@ async def split_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("split_code", None)
     context.user_data.pop("split_count", None)
     await update.message.reply_text("Split cancelled.")
+
+
+async def cmd_sort(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the standalone ticket sorting flow for an existing booking code."""
+    _clear_sort_runtime(context)
+    context.user_data["chat_id"] = update.effective_chat.id
+    args = context.args or []
+    if args:
+        code = "".join(args).replace(",", "").strip().upper()
+        if code:
+            context.user_data["sort_code"] = code
+            return await _prompt_sort_mode(update.message)
+
+    await update.message.reply_text(
+        "🗂 Send me the SportyBet booking code you want to reorganize.\n"
+        "I’ll keep the same picks, sort them, and generate a fresh code."
+    )
+    return SORT_CODE
+
+
+async def sort_receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive a booking code for the /sort flow."""
+    code = update.message.text.strip().upper().replace(" ", "")
+    if not code:
+        await update.message.reply_text("Send a valid booking code or /cancel.")
+        return SORT_CODE
+    context.user_data["sort_code"] = code
+    return await _prompt_sort_mode(update.message)
+
+
+async def _prompt_sort_mode(message, edit: bool = False):
+    """Ask how the ticket should be reordered."""
+    buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("By Date", callback_data="sort_mode_date"),
+            InlineKeyboardButton("By Time", callback_data="sort_mode_time"),
+        ]
+    ])
+    await _send_or_edit(
+        message,
+        "How should I reorganize this ticket?\n"
+        "Date = calendar date first, then kickoff.\n"
+        "Time = kickoff time-of-day first, then date.",
+        reply_markup=buttons,
+        edit=edit,
+    )
+    return SORT_MODE
+
+
+async def sort_receive_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive the requested sort mode for /sort."""
+    query = update.callback_query
+    await query.answer()
+    mode = query.data.replace("sort_mode_", "")
+    context.user_data["sort_mode"] = mode
+    return await _sort_and_rebook_code(query.message, context, mode, edit=True)
+
+
+async def _sort_and_rebook_code(message, context, mode: str, edit: bool = False):
+    """Fetch a booking code, reorder the same upcoming picks, and rebook them."""
+    code = context.user_data.get("sort_code")
+    if not code:
+        await _send_or_edit(message, "No booking code loaded. Start again with /sort.", edit=edit)
+        return ConversationHandler.END
+
+    job_token = _mark_job_start(context, "sort_ticket")
+    job_success = False
+    job_error = None
+    mode_label = "date" if mode == "date" else "time"
+
+    try:
+        await _send_or_edit(
+            message,
+            f"🗂 Fetching `{code}` and reorganizing it by {mode_label}...",
+            edit=edit,
+            parse_mode="Markdown",
+        )
+
+        data = await asyncio.to_thread(fetch_booking_code, code)
+        if not data:
+            job_success = True
+            await message.reply_text("I couldn't fetch that booking code. Double-check it and try again.")
+            return ConversationHandler.END
+
+        raw_picks = parse_outcomes(data)
+        pending_picks = [dict(p) for p in raw_picks if p.get("match_status") != "Ended"]
+        ended_count = len(raw_picks) - len(pending_picks)
+
+        if not pending_picks:
+            job_success = True
+            await message.reply_text("That ticket has no upcoming picks left to reorganize.")
+            return ConversationHandler.END
+
+        async def _enrich_pick(pick: dict) -> dict:
+            sporty_event = await asyncio.to_thread(find_event, pick.get("home", ""), pick.get("away", ""))
+            if sporty_event:
+                pick["_sporty_event"] = sporty_event
+                pick["_sort_kickoff_ms"] = int(sporty_event.get("estimateStartTime", 0) or 0)
+                pick["event_id"] = sporty_event.get("eventId", pick.get("event_id", ""))
+                kick_off = pick.get("_sort_kickoff_ms", 0)
+                if kick_off > 0:
+                    pick["date"] = datetime.fromtimestamp(kick_off / 1000).strftime("%Y-%m-%d %H:%M")
+            else:
+                pick["_sort_kickoff_ms"] = 0
+            return pick
+
+        enriched_picks = await asyncio.gather(*[_enrich_pick(pick) for pick in pending_picks])
+        sorted_picks = _sort_booking_picks(enriched_picks, mode)
+        booking_result = await _book_ticket_picks(sorted_picks)
+
+        lines = [
+            f"🗂 Sorted ticket from `{code}`",
+            f"Mode: {'Date first' if mode == 'date' else 'Time of day first'}",
+            "",
+        ]
+        if ended_count:
+            lines.append(f"Skipped ended picks: {ended_count}")
+            lines.append("")
+
+        for idx, pick in enumerate(sorted_picks, 1):
+            lines.append(f"{idx}. {_format_pick_kickoff(pick)} — {pick.get('home')} vs {pick.get('away')}")
+            lines.append(f"   {pick.get('market')}: {pick.get('pick')} @ {pick.get('odds', 0):.2f}")
+
+        lines.append("")
+        lines.append(f"Selections rebooked: {booking_result['selection_count']}/{len(sorted_picks)}")
+        await send_long_message(message, "\n".join(lines))
+
+        if booking_result["code"]:
+            await message.reply_text(
+                f"🎫 *Sorted Booking Code:* `{booking_result['code']}`\n\n"
+                f"Same picks, reorganized by {mode_label}.",
+                parse_mode="Markdown",
+            )
+        else:
+            await message.reply_text(
+                "⚠️ I reordered the ticket, but SportyBet did not return a new booking code."
+            )
+
+        if booking_result["failed"]:
+            await message.reply_text(
+                "⚠️ Some picks could not be rebooked:\n" + "\n".join(booking_result["failed"])
+            )
+
+        job_success = True
+        return ConversationHandler.END
+    except Exception as e:
+        job_error = e
+        logger.exception("Sort flow failed")
+        await message.reply_text(
+            "I hit an error while sorting that ticket. Please try again in a moment."
+        )
+        return ConversationHandler.END
+    finally:
+        _mark_job_finish(context, job_token, success=job_success, error=job_error)
+        _clear_sort_runtime(context)
+
+
+async def sort_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the /sort flow."""
+    _clear_sort_runtime(context)
+    await update.message.reply_text("Sort cancelled.")
     return ConversationHandler.END
 
 
@@ -4191,6 +4538,7 @@ async def post_init(application: Application):
         BotCommand("pick", "Get picks for target odds"),
         BotCommand("check", "Analyze SportyBet booking codes"),
         BotCommand("split", "Split a large ticket into smaller ones"),
+        BotCommand("sort", "Reorder an existing booking code"),
         BotCommand("chat", "Chat with the AI analyst"),
         BotCommand("settings", "Leagues, timeframe & pick settings"),
         BotCommand("budget", "Check API calls remaining"),
@@ -4501,6 +4849,21 @@ def main():
         conversation_timeout=300,
     )
     app.add_handler(check_conv)
+
+    sort_conv = ConversationHandler(
+        entry_points=[CommandHandler("sort", cmd_sort)],
+        states={
+            SORT_CODE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sort_receive_code),
+            ],
+            SORT_MODE: [
+                CallbackQueryHandler(sort_receive_mode, pattern=r"^sort_mode_"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", sort_cancel)],
+        allow_reentry=True,
+    )
+    app.add_handler(sort_conv)
 
     # /pick conversation handler
     pick_conv = ConversationHandler(
