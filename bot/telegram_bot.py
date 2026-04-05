@@ -99,7 +99,7 @@ PICK_TYPE, PICK_COUNT, PICK_ODDS, PICK_MODE, PICK_REVIEW, GAME_DIALOGUE = range(
 # Conversation states for /strategy custom flow
 STRAT_CUSTOM_CONFIDENCE, STRAT_CUSTOM_MARKETS, STRAT_CUSTOM_OVER, STRAT_CUSTOM_MIN_ODDS, STRAT_LEAGUES, STRAT_TIMEFRAME = range(20, 26)
 # Conversation states for /split flow
-SPLIT_CODE, SPLIT_COUNT, SPLIT_TARGETS, SPLIT_CONFIRM = range(30, 34)
+SPLIT_CODE, SPLIT_COUNT, SPLIT_TARGETS, SPLIT_CONFIRM, SPLIT_METHOD = range(30, 35)
 # Conversation states for /sort flow
 SORT_CODE, SORT_MODE = range(40, 42)
 
@@ -479,6 +479,19 @@ def _format_pick_kickoff(pick: dict) -> str:
     if kickoff_ms <= 0:
         return "Unknown kickoff"
     return datetime.fromtimestamp(kickoff_ms / 1000).strftime("%Y-%m-%d %H:%M")
+
+
+def _sort_picks_by_kickoff(picks: list[dict]) -> list[dict]:
+    """Sort picks by kickoff date/time (earliest first).
+
+    Used automatically before every booking call so tickets are
+    chronologically ordered. Does NOT mutate the input list.
+    Picks without a known kickoff time are placed at the end.
+    """
+    def _key(pick: dict):
+        ms = _kickoff_ms_from_pick(pick)
+        return (0 if ms > 0 else 1, ms if ms > 0 else float("inf"))
+    return sorted(picks, key=_key)
 
 
 def _sort_booking_picks(picks: list[dict], mode: str) -> list[dict]:
@@ -2084,13 +2097,23 @@ async def _pick_confirm_and_book(message, context):
 
 
 async def _book_ticket_picks(combo: list[dict]) -> dict:
-    """Build and submit one booking ticket to SportyBet."""
+    """Build and submit one booking ticket to SportyBet.
+
+    Picks are automatically sorted by kickoff date/time before booking
+    so the resulting ticket is ordered chronologically. This does NOT
+    affect which picks are selected — only the order they appear in.
+    """
     if not combo:
         return {"code": None, "failed": ["No picks in ticket"], "selection_count": 0}
 
+    # Sort picks by kickoff time before booking (earliest first).
+    # This ensures every ticket is chronologically ordered regardless
+    # of the order picks were selected by the scoring algorithm.
+    sorted_combo = _sort_picks_by_kickoff(combo)
+
     booking_selections = []
     failed_bookings = []
-    for p in combo:
+    for p in sorted_combo:
         event_id = p.get("event_id", "")
         sporty_event = p.get("_sporty_event")
         logger.info(f"Booking: {p['home']} vs {p['away']} | market={p['market']} pick={p['pick']} | event_id={event_id} | has_sporty_event={bool(sporty_event)}")
@@ -3475,10 +3498,176 @@ async def _split_fetch_code(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         ended = len(picks) - len(active_picks)
         lines.append(f"\n⚠️ {ended} ended game(s) excluded from split.")
 
-    lines.append(f"\n🔢 *Split into how many tickets?* (2-{min(5, len(active_picks))})")
+    lines.append("\n*How do you want to split?*")
 
     await send_long_message(update, "\n".join(lines))
+
+    # Enrich picks with kickoff times for date-based splitting
+    async def _enrich_kickoff(pick: dict) -> dict:
+        sporty_event = await asyncio.to_thread(find_event, pick.get("home", ""), pick.get("away", ""))
+        if sporty_event:
+            pick["_sporty_event"] = sporty_event
+            pick["_sort_kickoff_ms"] = int(sporty_event.get("estimateStartTime", 0) or 0)
+        return pick
+
+    await asyncio.gather(*[_enrich_kickoff(p) for p in active_picks])
+
+    # Count how many distinct dates we have
+    dates = set()
+    for p in active_picks:
+        ms = _kickoff_ms_from_pick(p)
+        if ms > 0:
+            dates.add(datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d"))
+
+    buttons = [
+        [InlineKeyboardButton("🎯 By Odds Targets", callback_data="split_method_odds")],
+    ]
+    if len(dates) >= 2:
+        buttons.append([
+            InlineKeyboardButton(
+                f"📅 By Date ({len(dates)} days)",
+                callback_data="split_method_date",
+            )
+        ])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="split_method_cancel")])
+
+    await update.message.reply_text(
+        "Choose a split method:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return SPLIT_METHOD
+
+
+async def split_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle split method selection: by odds targets or by date."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "split_method_cancel":
+        context.user_data.pop("split_picks", None)
+        context.user_data.pop("split_code", None)
+        await query.edit_message_text("Split cancelled.")
+        return ConversationHandler.END
+
+    if data == "split_method_date":
+        return await _split_by_date(query.message, context)
+
+    # Default: odds-based split — ask for ticket count
+    active_picks = context.user_data.get("split_picks", [])
+    max_splits = min(ticket_splitter.MAX_SPLITS, len(active_picks))
+    await query.edit_message_text(
+        f"🔢 *Split into how many tickets?* (2-{max_splits})",
+        parse_mode="Markdown",
+    )
     return SPLIT_COUNT
+
+
+async def _split_by_date(message, context):
+    """Split picks into one ticket per calendar date and book them."""
+    active_picks = context.user_data.get("split_picks", [])
+    code = context.user_data.get("split_code", "?")
+
+    if not active_picks:
+        await message.reply_text("No picks to split. Use /split to start again.")
+        return ConversationHandler.END
+
+    # Group picks by calendar date
+    date_groups: dict[str, list[dict]] = {}
+    no_date_picks: list[dict] = []
+
+    for p in active_picks:
+        ms = _kickoff_ms_from_pick(p)
+        if ms > 0:
+            date_key = datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d")
+            date_groups.setdefault(date_key, []).append(p)
+        else:
+            no_date_picks.append(p)
+
+    # Attach picks without dates to the earliest date group
+    if no_date_picks and date_groups:
+        earliest = min(date_groups.keys())
+        date_groups[earliest].extend(no_date_picks)
+    elif no_date_picks:
+        date_groups["Unknown"] = no_date_picks
+
+    if len(date_groups) < 2:
+        await message.reply_text(
+            "All picks are on the same date — nothing to split by date.\n"
+            "Try splitting by odds targets instead.",
+        )
+        # Go back to method selection
+        active = context.user_data.get("split_picks", [])
+        max_splits = min(ticket_splitter.MAX_SPLITS, len(active))
+        await message.reply_text(
+            f"🔢 *Split into how many tickets?* (2-{max_splits})",
+            parse_mode="Markdown",
+        )
+        return SPLIT_COUNT
+
+    # Sort dates chronologically
+    sorted_dates = sorted(date_groups.keys())
+
+    # Show preview
+    lines = [f"📅 *Splitting code {code} by date* — {len(sorted_dates)} tickets\n"]
+    for date_key in sorted_dates:
+        picks = date_groups[date_key]
+        ticket_odds = 1.0
+        for p in picks:
+            ticket_odds *= float(p.get("odds", 1.0))
+        lines.append(f"*{date_key}* — {len(picks)} pick(s), ~{ticket_odds:.2f} odds")
+        for p in picks:
+            ms = _kickoff_ms_from_pick(p)
+            time_str = datetime.fromtimestamp(ms / 1000).strftime("%H:%M") if ms > 0 else "?"
+            lines.append(f"  {time_str} {p.get('home', '?')} vs {p.get('away', '?')} — {p.get('market', '?')}: {p.get('pick', '?')} @ {p.get('odds', 0):.2f}")
+
+    await send_long_message(message, "\n".join(lines))
+
+    # Book each date group as a separate ticket
+    await message.reply_text("📋 Booking split tickets...")
+    booked = []
+    failed = []
+
+    for i, date_key in enumerate(sorted_dates):
+        picks = date_groups[date_key]
+        sorted_picks = _sort_picks_by_kickoff(picks)
+        selections = []
+        for p in sorted_picks:
+            sel = p.get("selection", {})
+            if sel and sel.get("eventId"):
+                selections.append({
+                    "eventId": sel["eventId"],
+                    "marketId": str(sel.get("marketId", "")),
+                    "outcomeId": str(sel.get("outcomeId", "")),
+                    "specifier": sel.get("specifier", ""),
+                })
+
+        if selections:
+            book_code = await asyncio.to_thread(create_booking_code, selections)
+            if book_code:
+                ticket_odds = 1.0
+                for p in picks:
+                    ticket_odds *= float(p.get("odds", 1.0))
+                booked.append((date_key, book_code, len(selections), ticket_odds))
+            else:
+                failed.append(date_key)
+        else:
+            failed.append(date_key)
+
+    # Show results
+    result_lines = ["🎉 *Date Split Results*\n"]
+    for date_key, book_code, count, odds in booked:
+        result_lines.append(
+            f"✅ *{date_key}*: `{book_code}` ({count} picks, {odds:.2f} odds)"
+        )
+    for date_key in failed:
+        result_lines.append(f"❌ *{date_key}*: booking failed")
+
+    await send_long_message(message, "\n".join(result_lines))
+
+    context.user_data.pop("split_picks", None)
+    context.user_data.pop("split_code", None)
+    return ConversationHandler.END
 
 
 async def split_receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3684,9 +3873,13 @@ async def split_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def _book_split_ticket(ticket: dict) -> str | None:
-    """Book a single split ticket via SportyBet API. Returns booking code or None."""
+    """Book a single split ticket via SportyBet API. Returns booking code or None.
+
+    Picks are sorted by kickoff time before booking for chronological order.
+    """
+    sorted_picks = _sort_picks_by_kickoff(ticket.get("picks", []))
     selections = []
-    for pick in ticket["picks"]:
+    for pick in sorted_picks:
         sel = pick.get("selection", {})
         if not sel or not sel.get("eventId"):
             continue
@@ -4880,6 +5073,9 @@ def main():
         states={
             SPLIT_CODE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, split_receive_code),
+            ],
+            SPLIT_METHOD: [
+                CallbackQueryHandler(split_method_callback, pattern=r"^split_method_"),
             ],
             SPLIT_COUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, split_receive_count),
