@@ -7,6 +7,7 @@ No Telegram imports. Can be called from bot handlers, OpenClaw tools, or web API
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 import requests
 
@@ -71,6 +72,19 @@ def parse_outcomes(data: dict) -> list[dict]:
         if specifier:
             pick_desc = f"{pick_desc} ({specifier})"
 
+        # Extract kickoff time from outcome or selection
+        estimate_start = (
+            outcome.get("estimateStartTime")
+            or sel.get("estimateStartTime")
+            or 0
+        )
+        match_date = ""
+        if estimate_start:
+            try:
+                match_date = datetime.fromtimestamp(int(estimate_start) / 1000).strftime("%Y-%m-%d %H:%M")
+            except (ValueError, TypeError, OSError):
+                pass
+
         if match_status == "Ended":
             if is_winning == 1:
                 rating = "won"
@@ -117,6 +131,8 @@ def parse_outcomes(data: dict) -> list[dict]:
             "score": score_str,
             "event_id": event_id,
             "selection": sel,
+            "date": match_date,
+            "_sort_kickoff_ms": int(estimate_start) if estimate_start else 0,
         })
 
     return picks

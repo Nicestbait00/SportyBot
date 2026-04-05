@@ -2531,6 +2531,9 @@ async def _explain_picks(message, context, combo, pick_nums):
         market_label = p.get("pick", "").replace("(total=", "").replace(")", "")
 
         lines.append(f"*{num}. {p['home']} vs {p['away']}*")
+        date_line = _pick_date_line(p)
+        if date_line:
+            lines.append(date_line)
         lines.append(f"   {p['market']}: {market_label} @ {p['odds']:.2f} [{conf}%]\n")
 
         # Data quality context
@@ -4269,6 +4272,11 @@ async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
                 sp["match_status"] = pick.get("match_status", "Upcoming")
                 sp["is_winning"] = pick.get("is_winning")
                 sp["score"] = pick.get("score", "")
+                # Preserve date from booking code if score_fixture didn't set one
+                if not sp.get("date") and pick.get("date"):
+                    sp["date"] = pick["date"]
+                if not sp.get("_sort_kickoff_ms") and pick.get("_sort_kickoff_ms"):
+                    sp["_sort_kickoff_ms"] = pick["_sort_kickoff_ms"]
 
             all_scored.extend(match_scored)
             analyzed_count += 1
@@ -4339,11 +4347,14 @@ async def _process_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
         if best_match:
             icon = verdict_icons.get(best_match.get("verdict", ""), "❓")
             conf = best_match.get("confidence", "?")
+            date_line = _pick_date_line(best_match) or _pick_date_line(pick)
             lines.append(
                 f"{icon} {pick['home']} vs {pick['away']}\n"
                 f"   Code: {pick['market']}: {pick['pick']} @ {pick['odds']:.2f}\n"
                 f"   Score: {best_match['market']}: {best_match['pick']} @ {best_match.get('odds', 0):.2f} [{conf}%]"
             )
+            if date_line:
+                lines.append(date_line)
             reasons = best_match.get("analysis_reasons", [])
             if reasons:
                 lines.append(f"   > {reasons[0]}")
