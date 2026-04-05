@@ -1344,8 +1344,8 @@ async def pick_receive_odds_text(update: Update, context: ContextTypes.DEFAULT_T
         for p in parts:
             try:
                 t = float(p)
-                if t < 1.5 or t > 500:
-                    await update.message.reply_text(f"Each target must be between 1.5 and 500. `{p}` is out of range.", parse_mode="Markdown")
+                if t < 1.5 or t > 10000:
+                    await update.message.reply_text(f"Each target must be between 1.5 and 10,000. `{p}` is out of range.", parse_mode="Markdown")
                     return PICK_ODDS
                 targets.append(t)
             except ValueError:
@@ -1372,8 +1372,8 @@ async def pick_receive_odds_text(update: Update, context: ContextTypes.DEFAULT_T
     except ValueError:
         await update.message.reply_text("Send a number (e.g. 10) or comma-separated (e.g. 5,10,25). /cancel to exit.")
         return PICK_ODDS
-    if target < 1.5 or target > 500:
-        await update.message.reply_text("Target odds must be between 1.5 and 500. Try again or /cancel.")
+    if target < 1.5 or target > 10000:
+        await update.message.reply_text("Target odds must be between 1.5 and 10,000. Try again or /cancel.")
         return PICK_ODDS
     req["target_odds"] = target
     req.pop("target_odds_list", None)
@@ -4607,8 +4607,8 @@ async def check_receive_odds_text(update: Update, context: ContextTypes.DEFAULT_
     except ValueError:
         await update.message.reply_text("Send a number (e.g. 10) or /cancel.")
         return CHECK_TARGET_ODDS
-    if target < 1.5 or target > 500:
-        await update.message.reply_text("Target odds must be between 1.5 and 500. Try again or /cancel.")
+    if target < 1.5 or target > 10000:
+        await update.message.reply_text("Target odds must be between 1.5 and 10,000. Try again or /cancel.")
         return CHECK_TARGET_ODDS
 
     context.user_data["check_target"] = target

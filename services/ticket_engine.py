@@ -333,6 +333,9 @@ def build_qualified_pool(
 
 # ── Ticket selectors ─────────────────────────────────────────────────────────
 
+MAX_PICKS_PER_TICKET = 50  # SportyBet hard limit
+
+
 def select_ticket_from_pool(
     qualified: list[dict],
     target: float,
@@ -398,7 +401,7 @@ def select_ticket_from_pool(
                 fill_picks = [p for p in fill_picks if pick_threshold(p) == fill_slot["threshold"]]
             fill_picks.sort(key=pick_selection_score, reverse=True)
             for pick in fill_picks:
-                if current_odds >= effective_target:
+                if current_odds >= effective_target or len(selected) >= MAX_PICKS_PER_TICKET:
                     break
                 mk = match_key(pick)
                 selected.append(pick)
@@ -411,7 +414,7 @@ def select_ticket_from_pool(
     deferred_for_diversity: list[dict] = []
 
     for pick in qualified:
-        if current_odds >= effective_target:
+        if current_odds >= effective_target or len(selected) >= MAX_PICKS_PER_TICKET:
             break
         mk = match_key(pick)
         if mk in used_matches or mk in disallowed_match_keys:
@@ -431,9 +434,9 @@ def select_ticket_from_pool(
         league_counts[league] = league_counts.get(league, 0) + 1
         market_counts[mkt] = market_counts.get(mkt, 0) + 1
 
-    if current_odds < effective_target:
+    if current_odds < effective_target and len(selected) < MAX_PICKS_PER_TICKET:
         for pick in deferred_for_diversity:
-            if current_odds >= effective_target:
+            if current_odds >= effective_target or len(selected) >= MAX_PICKS_PER_TICKET:
                 break
             mk = match_key(pick)
             if mk in used_matches or mk in disallowed_match_keys:
