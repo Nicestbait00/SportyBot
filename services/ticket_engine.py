@@ -333,6 +333,9 @@ def build_qualified_pool(
 
 # ── Ticket selectors ─────────────────────────────────────────────────────────
 
+MAX_PICKS_PER_TICKET = 50  # SportyBet hard limit
+
+
 def select_ticket_from_pool(
     qualified: list[dict],
     target: float,
@@ -351,6 +354,13 @@ def select_ticket_from_pool(
     selected: list[dict] = []
     used_matches: set[str] = set()
     current_odds = 1.0
+
+    # Overshoot target slightly so the final ticket actually meets/exceeds
+    # the user's requested odds. Without this, the greedy selector often
+    # stops one pick short because the last pick doesn't quite reach target.
+    # Cap the overshoot so high targets (50+) don't require too many extra picks.
+    overshoot = min(target * 0.10, 5.0)
+    effective_target = target + overshoot
 
     if market_slots:
         for slot in market_slots:
@@ -391,7 +401,7 @@ def select_ticket_from_pool(
                 fill_picks = [p for p in fill_picks if pick_threshold(p) == fill_slot["threshold"]]
             fill_picks.sort(key=pick_selection_score, reverse=True)
             for pick in fill_picks:
-                if current_odds >= target:
+                if current_odds >= effective_target or len(selected) >= MAX_PICKS_PER_TICKET:
                     break
                 mk = match_key(pick)
                 selected.append(pick)
@@ -404,7 +414,7 @@ def select_ticket_from_pool(
     deferred_for_diversity: list[dict] = []
 
     for pick in qualified:
-        if current_odds >= target:
+        if current_odds >= effective_target or len(selected) >= MAX_PICKS_PER_TICKET:
             break
         mk = match_key(pick)
         if mk in used_matches or mk in disallowed_match_keys:
@@ -424,9 +434,9 @@ def select_ticket_from_pool(
         league_counts[league] = league_counts.get(league, 0) + 1
         market_counts[mkt] = market_counts.get(mkt, 0) + 1
 
-    if current_odds < target:
+    if current_odds < effective_target and len(selected) < MAX_PICKS_PER_TICKET:
         for pick in deferred_for_diversity:
-            if current_odds >= target:
+            if current_odds >= effective_target or len(selected) >= MAX_PICKS_PER_TICKET:
                 break
             mk = match_key(pick)
             if mk in used_matches or mk in disallowed_match_keys:
@@ -484,11 +494,13 @@ def select_unique_ticket_from_pool(
     if not selected:
         return []
 
+    overshoot = min(target * 0.10, 5.0)
+    effective_target = target + overshoot
     current_odds, _ = ticket_totals(selected)
-    if current_odds >= target:
+    if current_odds >= effective_target:
         return selected
 
-    while current_odds < target:
+    while current_odds < effective_target:
         best_upgrade = None
         for idx, current_pick in enumerate(selected):
             mk = match_key(current_pick)
@@ -504,8 +516,8 @@ def select_unique_ticket_from_pool(
                 new_total = current_odds / max(float(current_pick.get("odds", 1.0)), 1.0) * float(alt.get("odds", 1.0))
                 score_drop = pick_selection_score(current_pick) - pick_selection_score(alt)
                 candidate_rank = (
-                    0 if new_total >= target else 1,
-                    abs(target - new_total),
+                    0 if new_total >= effective_target else 1,
+                    abs(effective_target - new_total),
                     score_drop,
                 )
                 if best_upgrade is None or candidate_rank < best_upgrade["rank"]:

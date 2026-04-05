@@ -64,6 +64,11 @@ def _pick_log_odds(pick: dict) -> float:
     return math.log(max(odds, 1.001))
 
 
+def _pick_kickoff_key(pick: dict):
+    """Sort key for ordering picks by kickoff date. Uses the 'date' string field."""
+    return pick.get("date", "") or "9999"
+
+
 def _pick_odds(pick: dict) -> float:
     """Get numeric odds from a pick dict."""
     try:
@@ -240,7 +245,8 @@ def format_split_summary(result: dict) -> str:
         )
         lines.append(f"📊 {t['pick_count']} picks\n")
 
-        for j, pick in enumerate(t["picks"], 1):
+        sorted_picks = sorted(t["picks"], key=_pick_kickoff_key)
+        for j, pick in enumerate(sorted_picks, 1):
             odds = _pick_odds(pick)
             home = pick.get("home", "?")
             away = pick.get("away", "?")
@@ -248,6 +254,9 @@ def format_split_summary(result: dict) -> str:
             pick_label = pick.get("pick", "?")
             shared_tag = " 🔁" if pick.get("shared") else ""
             lines.append(f"  {j}. {home} vs {away}{shared_tag}")
+            date_str = pick.get("date", "")
+            if date_str:
+                lines.append(f"     {date_str}")
             lines.append(f"     {market}: {pick_label} @ {odds:.2f}")
 
         shared_count = t.get("shared_count", 0)
@@ -278,13 +287,17 @@ def format_single_ticket(ticket: dict, ticket_idx: int) -> str:
     lines.append(f"🎯 Target: {t['target_odds']:.2f}  →  Actual: *{t['actual_odds']:.2f}* odds")
     lines.append(f"📊 {t['pick_count']} picks\n")
 
-    for j, pick in enumerate(t["picks"], 1):
+    sorted_picks = sorted(t["picks"], key=_pick_kickoff_key)
+    for j, pick in enumerate(sorted_picks, 1):
         odds = _pick_odds(pick)
         home = pick.get("home", "?")
         away = pick.get("away", "?")
         market = pick.get("market", "?")
         pick_label = pick.get("pick", "?")
         lines.append(f"{j}. {home} vs {away}")
+        date_str = pick.get("date", "")
+        if date_str:
+            lines.append(f"   {date_str}")
         lines.append(f"   {market}: {pick_label} @ {odds:.2f}")
 
     return "\n".join(lines)

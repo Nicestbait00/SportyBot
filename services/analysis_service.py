@@ -332,6 +332,7 @@ def score_fixture(
                 reasons = ov["reasons"][:]
                 if checked["warning"]:
                     reasons.append(checked["warning"])
+                conf = _apply_penalty(conf, reasons)
                 if conf >= 45:
                     scored.append({
                         **base_pick,
