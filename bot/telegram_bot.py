@@ -481,6 +481,19 @@ def _format_pick_kickoff(pick: dict) -> str:
     return datetime.fromtimestamp(kickoff_ms / 1000).strftime("%Y-%m-%d %H:%M")
 
 
+def _pick_date_line(pick: dict) -> str:
+    """Return a compact date/time line for display under a pick, or empty string."""
+    kickoff_ms = _kickoff_ms_from_pick(pick)
+    if kickoff_ms <= 0:
+        # Fallback: try the 'date' field set by score_fixture
+        date_str = pick.get("date", "")
+        if date_str:
+            return f"   {date_str}"
+        return ""
+    dt = datetime.fromtimestamp(kickoff_ms / 1000)
+    return f"   {dt.strftime('%a %d %b, %H:%M')}"
+
+
 def _sort_picks_by_kickoff(picks: list[dict]) -> list[dict]:
     """Sort picks by kickoff date/time (earliest first).
 
@@ -531,11 +544,15 @@ def format_picks_review(all_picks: list[dict], codes: list[str]) -> str:
         lost = sum(1 for p in ended if p["rating"] == "lost")
         lines.append(f"Completed: {won} won, {lost} lost\n")
 
-    for i, p in enumerate(pending, 1):
+    sorted_pending = _sort_picks_by_kickoff(pending)
+    for i, p in enumerate(sorted_pending, 1):
+        date_line = _pick_date_line(p)
         lines.append(
             f"{i}. {p['home']} vs {p['away']}\n"
             f"   {p['market']}: {p['pick']} @ {p['odds']:.2f}"
         )
+        if date_line:
+            lines.append(date_line)
     return "\n".join(lines)
 
 
@@ -1683,6 +1700,9 @@ def _build_ticket_review_text(ticket: dict, heading: str | None = None) -> str:
         conf = pick.get("data_confidence", pick.get("confidence", "?"))
         suffix = " ♻️" if is_reused else ""
         lines.append(f"{icon} {idx}. {pick.get('home')} vs {pick.get('away')}{suffix}")
+        date_line = _pick_date_line(pick)
+        if date_line:
+            lines.append(date_line)
         lines.append(f"   {pick.get('market')}: {market_label} @ ~{pick.get('odds', 0):.2f} [{conf}%]")
         reasons = pick.get("analysis_reasons", [])
         if reasons:
@@ -1763,7 +1783,8 @@ async def _show_pick_bundle_ticket_detail(message, context, edit: bool = False):
         return await _show_pick_bundle_summary(message, context, edit=edit)
 
     ticket = bundle[idx]
-    combo = ticket.get("picks", [])
+    combo = _sort_picks_by_kickoff(ticket.get("picks", []))
+    ticket["picks"] = combo
     context.user_data["pick_combo"] = combo
     context.user_data["pick_excluded"] = set(ticket.get("_excluded_pick_keys", set()))
 
@@ -1891,6 +1912,12 @@ async def _show_single_ticket_combo(message, context, ticket: dict, edit: bool =
     verdict_icons = {"strong": "🟢", "moderate": "🟡", "weak": "🟠"}
     lines = [f"🎯 Picks for ~{target:.0f} odds | {league_str} | {timeframe_str}", ""]
 
+    # Sort picks by kickoff for display — also update the ticket/combo
+    # so button indices stay consistent with displayed order.
+    selected = _sort_picks_by_kickoff(selected)
+    ticket["picks"] = selected
+    context.user_data["pick_combo"] = selected
+
     has_limited = False
     for idx, pick in enumerate(selected, 1):
         icon = verdict_icons.get(pick.get("verdict", ""), "❓")
@@ -1902,6 +1929,9 @@ async def _show_single_ticket_combo(message, context, ticket: dict, edit: bool =
         conf = pick.get("data_confidence", pick.get("confidence", 0))
         suffix = " ♻️" if is_reused else ""
         lines.append(f"{icon} {idx}. {pick.get('home')} vs {pick.get('away')}{suffix}")
+        date_line = _pick_date_line(pick)
+        if date_line:
+            lines.append(date_line)
         lines.append(f"   [{pick.get('league', '')}] {pick.get('market')}: {market_label} @ ~{pick.get('odds', 0):.2f} [{conf}%]")
         reasons = pick.get("analysis_reasons", [])
         if reasons:
@@ -4639,12 +4669,17 @@ async def check_review_callback(update: Update, context: ContextTypes.DEFAULT_TY
             return ConversationHandler.END
 
         # Book ALL picks (code + league) using /pick's booking logic
+        combo = _sort_picks_by_kickoff(combo)
+        context.user_data["pick_combo"] = combo
         total_odds = 1.0
         lines = ["✅ Final Selection:\n"]
         for i, p in enumerate(combo, 1):
             source_tag = " 📌" if p.get("_source") == "booking_code" else " 🔍"
             market_label = p["pick"].replace("(total=", "").replace(")", "") if "total=" in p.get("pick", "") else p.get("pick", "")
             lines.append(f"{i}. {p['home']} vs {p['away']}{source_tag}")
+            date_line = _pick_date_line(p)
+            if date_line:
+                lines.append(date_line)
             lines.append(f"   {p['market']}: {market_label} @ {p['odds']:.2f}")
             total_odds *= p["odds"]
         lines.append(f"\nTotal Odds: {total_odds:.2f}")
