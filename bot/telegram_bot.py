@@ -210,6 +210,9 @@ def _team_results_cache_key(team_name: str, count: int) -> str:
     return f"{team_name.strip().lower()}::{count}"
 
 
+_MAX_TEAM_RESULTS_CACHE = 50  # Max entries per user to prevent memory bloat
+
+
 async def _get_team_results_cached(
     context: ContextTypes.DEFAULT_TYPE,
     team_name: str,
@@ -221,6 +224,12 @@ async def _get_team_results_cached(
     key = _team_results_cache_key(team_name, count)
     if key in cache:
         return cache[key]
+
+    # Evict oldest entries if cache is too large
+    if len(cache) >= _MAX_TEAM_RESULTS_CACHE:
+        excess = len(cache) - _MAX_TEAM_RESULTS_CACHE + 10  # free 10 slots
+        for old_key in list(cache.keys())[:excess]:
+            del cache[old_key]
 
     semaphore = context.application.bot_data.get("team_results_semaphore")
     if semaphore is None:
@@ -496,6 +505,8 @@ def _sort_booking_picks(picks: list[dict], mode: str) -> list[dict]:
         )
 
     return sorted([dict(p) for p in picks], key=_sort_key)
+
+
 def format_picks_review(all_picks: list[dict], codes: list[str]) -> str:
     """Format all picks from multiple codes into a review summary (basic, no deep analysis)."""
     lines = [f"Review: {len(all_picks)} games from {len(codes)} code(s)\n"]
@@ -900,6 +911,35 @@ def _clear_sort_runtime(context: ContextTypes.DEFAULT_TYPE) -> None:
         "sort_pending_picks",
     ]:
         context.user_data.pop(key, None)
+
+
+_TRANSIENT_USER_DATA_KEYS = [
+    "pick_all_scored", "pick_combo", "pick_target", "pick_excluded",
+    "pick_shuffle_seed", "_pick_msg", "pick_market_slots", "pick_request",
+    "pick_bundle", "pick_bundle_mode", "pick_bundle_fallback",
+    "pick_bundle_review_mode", "pick_bundle_allow_reuse",
+    "active_ticket_index", "pick_change_idx", "pick_change_alts",
+    "_team_results_cache", "sort_code", "sort_mode", "sort_pending_picks",
+    "check_codes", "check_all_picks", "check_pending_picks",
+    "agent_history",
+]
+
+
+def _prune_stale_user_data(application: Application) -> int:
+    """Remove transient conversation state from all persisted user_data dicts.
+
+    This prevents PicklePersistence from bloating with abandoned session data.
+    Called once on startup.
+    """
+    pruned = 0
+    for uid, ud in application.user_data.items():
+        for key in _TRANSIENT_USER_DATA_KEYS:
+            if key in ud:
+                del ud[key]
+                pruned += 1
+    if pruned:
+        logger.info(f"Pruned {pruned} stale keys from user_data on startup.")
+    return pruned
 
 
 def _default_pick_request() -> dict:
@@ -3783,7 +3823,27 @@ async def _sort_and_rebook_code(message, context, mode: str, edit: bool = False)
 
         enriched_picks = await asyncio.gather(*[_enrich_pick(pick) for pick in pending_picks])
         sorted_picks = _sort_booking_picks(enriched_picks, mode)
-        booking_result = await _book_ticket_picks(sorted_picks)
+
+        # Reuse original selection data from the booking code instead of
+        # re-matching via build_booking_selection (which fails because
+        # parse_outcomes returns display descriptions, not internal market names).
+        booking_selections = []
+        failed_bookings = []
+        for p in sorted_picks:
+            sel = p.get("selection", {})
+            if sel and sel.get("eventId"):
+                booking_selections.append({
+                    "eventId": sel["eventId"],
+                    "marketId": str(sel.get("marketId", "")),
+                    "outcomeId": str(sel.get("outcomeId", "")),
+                    "specifier": sel.get("specifier", ""),
+                })
+            else:
+                failed_bookings.append(f"{p.get('home', '?')} vs {p.get('away', '?')}: missing selection data")
+
+        sort_code = None
+        if booking_selections:
+            sort_code = await asyncio.to_thread(create_booking_code, booking_selections)
 
         lines = [
             f"🗂 Sorted ticket from `{code}`",
@@ -3799,12 +3859,12 @@ async def _sort_and_rebook_code(message, context, mode: str, edit: bool = False)
             lines.append(f"   {pick.get('market')}: {pick.get('pick')} @ {pick.get('odds', 0):.2f}")
 
         lines.append("")
-        lines.append(f"Selections rebooked: {booking_result['selection_count']}/{len(sorted_picks)}")
+        lines.append(f"Selections rebooked: {len(booking_selections)}/{len(sorted_picks)}")
         await send_long_message(message, "\n".join(lines))
 
-        if booking_result["code"]:
+        if sort_code:
             await message.reply_text(
-                f"🎫 *Sorted Booking Code:* `{booking_result['code']}`\n\n"
+                f"🎫 *Sorted Booking Code:* `{sort_code}`\n\n"
                 f"Same picks, reorganized by {mode_label}.",
                 parse_mode="Markdown",
             )
@@ -3813,9 +3873,9 @@ async def _sort_and_rebook_code(message, context, mode: str, edit: bool = False)
                 "⚠️ I reordered the ticket, but SportyBet did not return a new booking code."
             )
 
-        if booking_result["failed"]:
+        if failed_bookings:
             await message.reply_text(
-                "⚠️ Some picks could not be rebooked:\n" + "\n".join(booking_result["failed"])
+                "⚠️ Some picks could not be rebooked:\n" + "\n".join(failed_bookings)
             )
 
         job_success = True
@@ -4548,6 +4608,21 @@ async def post_init(application: Application):
     await application.bot.set_my_commands(commands)
     logger.info("Bot command menu registered.")
 
+    # Prune stale cache files to prevent disk bloat on Railway
+    try:
+        from data.data_collector import prune_cache
+        deleted = await asyncio.to_thread(prune_cache, 86400)  # 24h
+        if deleted:
+            logger.info(f"Pruned {deleted} stale cache files on startup.")
+    except Exception as e:
+        logger.warning(f"Cache pruning failed on startup: {e}")
+
+    # Clean up stale user_data from PicklePersistence to free memory
+    try:
+        _prune_stale_user_data(application)
+    except Exception as e:
+        logger.warning(f"User data cleanup failed on startup: {e}")
+
     # Pre-warm the SportyBet event index so cached picks can be booked immediately
     try:
         await asyncio.to_thread(build_event_index, force=False)
@@ -4862,6 +4937,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", sort_cancel)],
         allow_reentry=True,
+        conversation_timeout=300,
     )
     app.add_handler(sort_conv)
 

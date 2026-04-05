@@ -66,7 +66,7 @@ def _cache_get(key: str, ttl: int = 86400) -> Optional[Any]:
 
 def _cache_set(key: str, payload: Any) -> None:
     path = CACHE_DIR / f"{key}.json"
-    path.write_text(json.dumps({"_ts": time.time(), "payload": payload}))
+    path.write_text(json.dumps({"_ts": time.time(), "payload": payload}, separators=(",", ":")))
 
 
 def _cache_key(prefix: str, value: str) -> str:

@@ -232,19 +232,16 @@ def build_event_index(force: bool = False) -> dict:
     # Fetch fresh
     events = fetch_all_events()
 
-    # Build index keyed by "home_norm|away_norm"
+    # Build index keyed by "home_norm|away_norm" only — no duplicates.
+    # The find_event() function handles fuzzy/substring matching already,
+    # so the _home_/_away_ prefix entries were redundant and tripled memory.
     index = {}
     for e in events:
         key = f"{e['home_norm']}|{e['away_norm']}"
         index[key] = e
 
-        # Also index by partial names for fuzzy matching
-        # e.g., "arsenal" alone could match
-        index[f"_home_{e['home_norm']}"] = e
-        index[f"_away_{e['away_norm']}"] = e
-
-    # Save cache
-    _INDEX_FILE.write_text(json.dumps({"_ts": time.time(), "index": index}))
+    # Save cache (compact JSON to reduce disk usage)
+    _INDEX_FILE.write_text(json.dumps({"_ts": time.time(), "index": index}, separators=(",", ":")))
     logger.info(f"Built SportyBet event index: {len(events)} events")
 
     return index

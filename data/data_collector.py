@@ -51,7 +51,38 @@ def _write_cache(key: str, payload: Any) -> None:
     """Persist a response to the cache directory."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path = CACHE_DIR / f"{key}.json"
-    path.write_text(json.dumps({"_ts": time.time(), "payload": payload}, indent=2))
+    path.write_text(json.dumps({"_ts": time.time(), "payload": payload}, separators=(",", ":")))
+
+
+def prune_cache(max_age_seconds: int = 86400, subdirs: bool = True) -> int:
+    """Delete cache files older than max_age_seconds. Returns count deleted.
+
+    Called on startup to prevent unbounded disk growth on Railway.
+    Default: delete files older than 24 hours.
+    """
+    deleted = 0
+    now = time.time()
+    dirs = [CACHE_DIR]
+    if subdirs:
+        dirs.extend(p for p in CACHE_DIR.iterdir() if p.is_dir())
+    for cache_dir in dirs:
+        if not cache_dir.exists():
+            continue
+        for f in cache_dir.glob("*.json"):
+            try:
+                data = json.loads(f.read_text())
+                ts = data.get("_ts", 0)
+                if now - ts > max_age_seconds:
+                    f.unlink()
+                    deleted += 1
+            except (json.JSONDecodeError, OSError):
+                # Corrupt or unreadable — delete it
+                try:
+                    f.unlink()
+                    deleted += 1
+                except OSError:
+                    pass
+    return deleted
 
 
 # ── Persistent API budget tracking ───────────────────────────────────────────
@@ -76,7 +107,7 @@ def _load_budget() -> dict:
 
 
 def _save_budget(budget: dict) -> None:
-    _BUDGET_FILE.write_text(json.dumps(budget, indent=2))
+    _BUDGET_FILE.write_text(json.dumps(budget))
 
 
 def _increment_budget() -> int:
