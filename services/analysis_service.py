@@ -34,7 +34,6 @@ def add_extended_picks(
     markets: dict,
     base_pick: dict,
     data_quality: str,
-    partial_penalty: int = 0,
 ):
     """Generate picks for extended markets from scorer output + real SportyBet odds."""
 
@@ -58,9 +57,6 @@ def add_extended_picks(
         reasons = sc["reasons"][:]
         if checked["warning"]:
             reasons.append(checked["warning"])
-        if partial_penalty:
-            conf = max(0, conf - partial_penalty)
-            reasons.append("Partial form data — one team's history unavailable")
         if conf >= 40:
             all_scored.append({
                 **base_pick,
@@ -257,43 +253,10 @@ def score_fixture(
     home_form = _summarize_form(home_results) if home_results else None
     away_form = _summarize_form(away_results) if away_results else None
 
-    # Partial data: if one team has form data, use a neutral placeholder for
-    # the missing team so we can still run the scorer (with reduced confidence).
-    partial_penalty = 0
     if home_form and away_form:
-        data_quality = "good"
-    elif home_form or away_form:
-        data_quality = "fair"
-        partial_penalty = 15  # reduce confidence for all picks
-        _neutral = {
-            "played": 5, "wins": 2, "draws": 1, "losses": 2,
-            "goals_scored": 6, "goals_conceded": 6,
-            "avg_scored": 1.2, "avg_conceded": 1.2,
-            "form_string": "WDLWL",
-            "home_played": 2, "home_wins": 1, "home_draws": 0, "home_losses": 1,
-            "home_avg_scored": 1.2, "home_avg_conceded": 1.2,
-            "away_played": 3, "away_wins": 1, "away_draws": 1, "away_losses": 1,
-            "away_avg_scored": 1.2, "away_avg_conceded": 1.2,
-        }
-        if not home_form:
-            home_form = _neutral
-            home_results = home_results or []
-        if not away_form:
-            away_form = _neutral
-            away_results = away_results or []
-    else:
-        data_quality = None  # signals odds-only path below
-
-    if data_quality is not None:
         # ── Multi-factor scoring via scorer.py ──
+        data_quality = "good"
         scores = score_match(home_form, away_form, home_results, away_results)
-
-        def _apply_penalty(conf: int, reasons: list[str]) -> int:
-            """Apply partial-data confidence penalty if applicable."""
-            if partial_penalty:
-                conf = max(0, conf - partial_penalty)
-                reasons.append("Partial form data — one team's history unavailable")
-            return conf
 
         def _get_odds_1x2(outcome_id: str) -> float:
             o = real_1x2.get("outcomes", {}).get(outcome_id, {})
@@ -326,7 +289,6 @@ def score_fixture(
             reasons = hw["reasons"][:]
             if checked["warning"]:
                 reasons.append(checked["warning"])
-            conf = _apply_penalty(conf, reasons)
             if conf >= 45:
                 scored.append({
                     **base_pick,
@@ -348,7 +310,6 @@ def score_fixture(
             reasons = aw["reasons"][:]
             if checked["warning"]:
                 reasons.append(checked["warning"])
-            conf = _apply_penalty(conf, reasons)
             if conf >= 45:
                 scored.append({
                     **base_pick,
@@ -394,7 +355,6 @@ def score_fixture(
             reasons = bt["reasons"][:]
             if checked["warning"]:
                 reasons.append(checked["warning"])
-            conf = _apply_penalty(conf, reasons)
             if conf >= 45:
                 scored.append({
                     **base_pick,
@@ -408,7 +368,7 @@ def score_fixture(
                 })
 
         # ── Extended markets ──
-        add_extended_picks(scored, scores, markets, base_pick, data_quality, partial_penalty)
+        add_extended_picks(scored, scores, markets, base_pick, data_quality)
 
     else:
         # ── Odds-only analysis (no form data available) ──

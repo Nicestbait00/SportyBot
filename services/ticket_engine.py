@@ -113,8 +113,6 @@ def pick_selection_score(p: dict) -> float:
         bonus -= 8.0
         if is_thin_data_safe_pick(p):
             bonus += 4.0
-    elif data_quality == "fair":
-        bonus -= 3.0
 
     odds_penalty = max(0.0, odds - 1.8) * 6.0
     return conf + bonus - odds_penalty
