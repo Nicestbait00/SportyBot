@@ -354,10 +354,12 @@ def select_ticket_from_pool(
     used_matches: set[str] = set()
     current_odds = 1.0
 
-    # Overshoot target by 10% so the final ticket actually meets/exceeds
+    # Overshoot target slightly so the final ticket actually meets/exceeds
     # the user's requested odds. Without this, the greedy selector often
     # stops one pick short because the last pick doesn't quite reach target.
-    effective_target = target * 1.10
+    # Cap the overshoot so high targets (50+) don't require too many extra picks.
+    overshoot = min(target * 0.10, 5.0)
+    effective_target = target + overshoot
 
     if market_slots:
         for slot in market_slots:
@@ -491,7 +493,8 @@ def select_unique_ticket_from_pool(
     if not selected:
         return []
 
-    effective_target = target * 1.10
+    overshoot = min(target * 0.10, 5.0)
+    effective_target = target + overshoot
     current_odds, _ = ticket_totals(selected)
     if current_odds >= effective_target:
         return selected

@@ -1662,11 +1662,14 @@ def _generate_pick_bundle(context) -> tuple[list[dict], dict | None, bool]:
     target = float(req.get("target_odds") or context.user_data.get("pick_target", 10))
 
     if req.get("ticket_type") != "multiple":
-        qualified = _build_qualified_pool(all_scored, excluded, pick_cfg, market_slots, shuffle_seed)
-        picks = _select_ticket_from_pool(qualified, target, market_slots, set())
-        if not picks:
+        # Use generate_dynamic_bundle with ticket_count=1 so the fallback
+        # profiles kick in when the primary config can't reach the target.
+        bundle, profile, reused = _generate_dynamic_bundle(
+            all_scored, 1, target, pick_cfg, excluded, market_slots, shuffle_seed,
+        )
+        if not bundle:
             return [], None, False
-        return [_make_ticket_entry(1, "single", target, picks, [])], pick_cfg, False
+        return bundle, profile, reused
 
     ticket_count = int(req.get("ticket_count", 2))
     ticket_mode = req.get("ticket_mode", "dynamic")
