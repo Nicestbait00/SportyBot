@@ -14,13 +14,7 @@ from core.config import DEFAULT_ENABLED_MARKETS
 
 # ── Pick helpers ──────────────────────────────────────────────────────────────
 
-def confidence_verdict(conf: int) -> str:
-    """Map confidence score to verdict label."""
-    if conf >= 75:
-        return "strong"
-    elif conf >= 60:
-        return "moderate"
-    return "weak"
+from services.analysis_service import verdict as confidence_verdict
 
 
 def pick_key(p: dict) -> str:

@@ -20,7 +20,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
-from core.scorer import score_match
+from core.scorer import score_match, _poisson_over_prob
 
 import requests
 from dotenv import load_dotenv
@@ -970,14 +970,7 @@ def _count_streak(form: str, char: str) -> int:
     return count
 
 
-def _poisson_over_prob(expected: float, threshold: float) -> float:
-    if expected <= 0:
-        return 0.0
-    k = int(math.floor(threshold))
-    cumulative = 0.0
-    for i in range(k + 1):
-        cumulative += (expected ** i) * math.exp(-expected) / math.factorial(i)
-    return 1.0 - cumulative
+# _poisson_over_prob is now imported from core.scorer (canonical location)
 
 
 def _odds_to_confidence(odds: float) -> int:
